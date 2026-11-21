@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ft_api::FrankenTorchSession;
-use ft_autograd::{AutogradError, FunctionCtx, TensorNodeId};
+use ft_autograd::{AutogradError, TensorNodeId};
 use ft_core::{DType, DenseTensor, DenseTensorError, Device};
 use ft_dispatch::{DispatchError, DispatchKeyError};
 
@@ -832,26 +832,37 @@ pub fn clip_grad_value_(
 }
 
 /// Flatten parameters into a single 1D tensor.
+///
+/// Parameters must share their dtype and device. Empty parameters retain their
+/// dtype and autograd edges. Validation completes before adding graph nodes.
 pub fn parameters_to_vector(
     session: &mut FrankenTorchSession,
     parameters: &[TensorNodeId],
 ) -> Result<TensorNodeId, AutogradError> {
-    let mut flattened = Vec::new();
+    let mut parameter_sizes = Vec::with_capacity(parameters.len());
+    let mut metadata = None;
     for &parameter in parameters {
         let shape = session.tensor_shape(parameter)?;
-        let mut numel = 1usize;
-        for dim in shape {
-            if dim == 0 {
-                numel = 0;
-                break;
-            }
-            numel = numel
-                .checked_mul(dim)
-                .ok_or_else(|| gradient_utils_error("parameters_to_vector shape overflow"))?;
+        let dtype = session.tensor_dtype(parameter)?;
+        let device = session.tensor_device(parameter)?;
+        if !dtype.is_floating_point() && !dtype.is_complex() {
+            return Err(gradient_utils_error(
+                "parameters_to_vector requires floating-point or complex parameters",
+            ));
         }
-        if numel == 0 {
-            continue;
+        if metadata.is_some_and(|expected| expected != (dtype, device)) {
+            return Err(gradient_utils_error(
+                "parameters_to_vector parameters must have matching dtype and device",
+            ));
         }
+        metadata = Some((dtype, device));
+        parameter_sizes.push(checked_shape_numel(
+            &shape,
+            "parameters_to_vector shape overflow",
+        )?);
+    }
+    let mut flattened = Vec::with_capacity(parameters.len());
+    for (&parameter, numel) in parameters.iter().zip(parameter_sizes) {
         flattened.push(session.tensor_reshape(parameter, vec![numel])?);
     }
     match flattened.as_slice() {
@@ -862,52 +873,96 @@ pub fn parameters_to_vector(
 }
 
 /// Copy values from a flat 1D tensor back into parameter tensors.
+///
+/// The source and destinations must have the same dtype and device. The complete
+/// footprint and every destination are validated before any parameter changes.
+/// The copy preserves typed storage values, parameter identities, metadata and
+/// gradient mode without adding graph nodes. Existing forward graphs still
+/// detect the parameter version change at backward time.
 pub fn vector_to_parameters(
     session: &mut FrankenTorchSession,
     vector: TensorNodeId,
     parameters: &[TensorNodeId],
 ) -> Result<(), AutogradError> {
-    let (flat_values, flat_meta) = session.tensor_values_meta(vector)?;
+    let flat = session.tensor_snapshot(vector)?;
+    let flat_meta = flat.meta();
     if flat_meta.shape().len() != 1 {
         return Err(gradient_utils_error(
             "vector_to_parameters requires a 1D source vector",
         ));
     }
-
+    if !flat_meta.dtype().is_floating_point() && !flat_meta.dtype().is_complex() {
+        return Err(gradient_utils_error(
+            "vector_to_parameters requires a floating-point or complex vector",
+        ));
+    }
+    let mut parameter_metadata = Vec::with_capacity(parameters.len());
     let mut offset = 0usize;
-    session.no_grad_enter();
     for &parameter in parameters {
-        let (param_values, param_meta) = session.tensor_values_meta(parameter)?;
-        let len = param_values.len();
-        let Some(end) = offset.checked_add(len) else {
-            session.no_grad_exit();
-            return Err(gradient_utils_error("vector_to_parameters offset overflow"));
-        };
-        if end > flat_values.len() {
-            session.no_grad_exit();
+        let param_meta = session.tensor_snapshot(parameter)?.meta().clone();
+        if param_meta.dtype() != flat_meta.dtype() || param_meta.device() != flat_meta.device() {
+            return Err(gradient_utils_error(
+                "vector_to_parameters source and parameters must have matching dtype and device",
+            ));
+        }
+        let len = checked_shape_numel(param_meta.shape(), "vector_to_parameters shape overflow")?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| gradient_utils_error("vector_to_parameters offset overflow"))?;
+        if end > flat_meta.numel() {
             return Err(gradient_utils_error(
                 "vector_to_parameters source vector is shorter than parameter footprint",
             ));
         }
-
-        let chunk_node = session.tensor_variable(
-            flat_values[offset..end].to_vec(),
-            param_meta.shape().to_vec(),
-            false,
-        )?;
-        session.tensor_zero_(parameter)?;
-        session.tensor_add_(parameter, chunk_node)?;
+        parameter_metadata.push((parameter, param_meta, offset, len));
         offset = end;
     }
-    session.no_grad_exit();
-
-    if offset != flat_values.len() {
+    if offset != flat_meta.numel() {
         return Err(gradient_utils_error(
             "vector_to_parameters source vector has unused trailing values",
         ));
     }
 
-    Ok(())
+    let mut updates = Vec::with_capacity(parameters.len());
+    let source_stride = flat_meta.strides()[0];
+    for (parameter, param_meta, offset, len) in parameter_metadata {
+        // A shaped view of the vector's logical slice avoids converting F32,
+        // half or complex values through F64. It also preserves source strides,
+        // NaN payloads and signed zeros without introducing temporary tape nodes.
+        let source_meta = if len == 0 {
+            ft_core::TensorMeta::from_shape(
+                param_meta.shape().to_vec(),
+                flat_meta.dtype(),
+                flat_meta.device(),
+            )
+        } else {
+            let source_offset = offset
+                .checked_mul(source_stride)
+                .and_then(|offset| offset.checked_add(flat_meta.storage_offset()))
+                .ok_or_else(|| {
+                    gradient_utils_error("vector_to_parameters storage offset overflow")
+                })?;
+            let strides = ft_core::contiguous_strides(param_meta.shape())
+                .into_iter()
+                .map(|stride| {
+                    stride.checked_mul(source_stride).ok_or_else(|| {
+                        gradient_utils_error("vector_to_parameters source stride overflow")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            ft_core::TensorMeta::from_shape_and_strides(
+                param_meta.shape().to_vec(),
+                strides,
+                source_offset,
+                flat_meta.dtype(),
+                flat_meta.device(),
+            )
+            .map_err(DenseTensorError::from)?
+        };
+        let source = DenseTensor::from_typed_storage(source_meta, flat.typed_storage().clone())?;
+        updates.push((parameter, source));
+    }
+    session.tensor_load_state(&updates)
 }
 
 /// Fully connected linear layer: output = input @ weight^T + bias.
@@ -37964,6 +38019,234 @@ mod tests {
         assert!(matches!(err, AutogradError::Dispatch(_)));
     }
 
+    #[test]
+    fn vector_to_parameters_failures_are_atomic_and_preserve_grad_mode() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for disabled_grad in [false, true] {
+                for invalid in 0..6 {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let first = session
+                        .tensor_variable(vec![7.0, 8.0], vec![2], true)
+                        .unwrap();
+                    let second = session
+                        .tensor_variable(vec![9.0, 10.0], vec![2], true)
+                        .unwrap();
+                    let mut parameters = vec![first, second];
+                    let values = match invalid {
+                        0 => vec![1.0, 2.0, 3.0],
+                        1 => vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                        _ => vec![1.0, 2.0, 3.0, 4.0],
+                    };
+                    let vector = session
+                        .tensor_variable(values.clone(), vec![values.len()], false)
+                        .unwrap();
+                    match invalid {
+                        2 => parameters[1] = TensorNodeId(usize::MAX),
+                        3 => {
+                            parameters[1] = loss_test_tensor(
+                                &mut session,
+                                vec![9.0, 10.0],
+                                vec![2],
+                                DType::F32,
+                                true,
+                            );
+                        }
+                        4 => {
+                            let meta = TensorMeta::from_shape_and_strides(
+                                vec![2],
+                                vec![0],
+                                0,
+                                DType::F64,
+                                Device::Cpu,
+                            )
+                            .unwrap();
+                            parameters[1] = session.tensor_variable_from_storage(
+                                DenseTensor::from_storage(meta, vec![9.0]).unwrap(),
+                                false,
+                            );
+                        }
+                        5 => {
+                            parameters[1] = session.tensor_variable_from_storage(
+                                DenseTensor::from_contiguous_values(
+                                    vec![9.0, 10.0],
+                                    vec![2],
+                                    Device::Cuda,
+                                )
+                                .unwrap(),
+                                false,
+                            );
+                        }
+                        _ => {}
+                    }
+                    let before_first = session.tensor_snapshot(first).unwrap();
+                    let before_second = session.tensor_snapshot(second).unwrap();
+                    let count = session.autograd_graph_node_count();
+                    if disabled_grad {
+                        session.no_grad_enter();
+                    }
+                    assert!(vector_to_parameters(&mut session, vector, &parameters).is_err());
+                    assert_eq!(session.is_grad_enabled(), !disabled_grad);
+                    assert_eq!(session.autograd_graph_node_count(), count);
+                    for (node, before) in [(first, before_first), (second, before_second)] {
+                        let after = session.tensor_snapshot(node).unwrap();
+                        assert_eq!(after.meta(), before.meta());
+                        assert_eq!(after.version(), before.version());
+                        assert_eq!(
+                            model_state_storage_bits(&after),
+                            model_state_storage_bits(&before)
+                        );
+                    }
+                    if disabled_grad {
+                        session.no_grad_exit();
+                    }
+                    let square = session.tensor_square(first).unwrap();
+                    let loss = session.tensor_sum(square).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    assert_eq!(report.gradient(first).unwrap(), &[14.0, 16.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_to_parameters_copies_strided_f32_values_exactly_without_nodes() {
+        let source_meta =
+            TensorMeta::from_shape_and_strides(vec![6], vec![2], 1, DType::F32, Device::Cpu)
+                .unwrap();
+        let special = [
+            f32::from_bits(0x7fc0_0123),
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2.5,
+            -3.0,
+        ];
+        let source_values = vec![
+            99.0, special[0], 99.0, special[1], 99.0, special[2], 99.0, special[3], 99.0,
+            special[4], 99.0, special[5],
+        ];
+        let source = DenseTensor::from_storage_f32(source_meta, source_values).unwrap();
+        let target_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![1, 3], 1, DType::F32, Device::Cpu)
+                .unwrap();
+        let target = DenseTensor::from_storage_f32(target_meta.clone(), vec![88.0; 8]).unwrap();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let vector = session.tensor_variable_from_storage(source, true);
+        let first = session.tensor_variable_from_storage(target, true);
+        let second = loss_test_tensor(&mut session, vec![0.0; 2], vec![2], DType::F32, true);
+        let empty = loss_test_tensor(&mut session, vec![], vec![0, 2], DType::F32, true);
+        let before = session.tensor_snapshot(first).unwrap();
+        let count = session.autograd_graph_node_count();
+        session.with_no_grad(|session| {
+            vector_to_parameters(session, vector, &[first, second, empty]).unwrap();
+            assert!(!session.is_grad_enabled());
+        });
+        assert!(session.is_grad_enabled());
+        assert_eq!(session.autograd_graph_node_count(), count);
+        let restored = session.tensor_snapshot(first).unwrap();
+        assert_eq!(restored.meta(), &target_meta);
+        assert_eq!(restored.id(), before.id());
+        assert_eq!(restored.storage_id(), before.storage_id());
+        assert_eq!(restored.version(), before.version() + 1);
+        let expected = [
+            88.0, special[0], special[2], 88.0, special[1], special[3], 88.0, 88.0,
+        ];
+        let expected_bits: Vec<_> = expected.iter().map(|v| u64::from(v.to_bits())).collect();
+        assert_eq!(model_state_storage_bits(&restored), expected_bits);
+        assert_eq!(
+            session.tensor_values_lossy_f64(second).unwrap(),
+            [2.5, -3.0]
+        );
+        assert_eq!(session.tensor_shape(empty).unwrap(), [0, 2]);
+        assert!(session.tensor_requires_grad(first).unwrap());
+        assert!(session.tensor_requires_grad(empty).unwrap());
+        let sum = session.tensor_sum(second).unwrap();
+        let report = session.tensor_backward(sum).unwrap();
+        assert_eq!(report.gradient(second).unwrap(), &[1.0, 1.0]);
+        assert!(report.gradient(vector).is_none());
+    }
+
+    #[test]
+    fn vector_to_parameters_preserves_all_floating_and_complex_storage() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            let source = DenseTensor::from_contiguous_values(
+                vec![1.25, -0.0, f64::NAN, f64::INFINITY],
+                vec![4],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let target = DenseTensor::from_contiguous_values(vec![0.0; 4], vec![2, 2], Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let expected = model_state_storage_bits(&source);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let vector = session.tensor_variable_from_storage(source, false);
+            let parameter = session.tensor_variable_from_storage(target, false);
+            vector_to_parameters(&mut session, vector, &[parameter]).unwrap();
+            let snapshot = session.tensor_snapshot(parameter).unwrap();
+            assert_eq!(snapshot.meta().dtype(), dtype);
+            assert_eq!(snapshot.meta().shape(), [2, 2]);
+            assert_eq!(model_state_storage_bits(&snapshot), expected, "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn parameters_to_vector_keeps_empty_dtype_and_gradient_edges() {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let first = loss_test_tensor(&mut session, vec![], vec![0, 2], dtype, true);
+            let second = loss_test_tensor(&mut session, vec![], vec![0], dtype, true);
+            let vector = parameters_to_vector(&mut session, &[first, second]).unwrap();
+            assert_eq!(session.tensor_dtype(vector).unwrap(), dtype);
+            assert_eq!(session.tensor_shape(vector).unwrap(), [0]);
+            assert!(session.tensor_requires_grad(vector).unwrap());
+            let sum = session.tensor_sum(vector).unwrap();
+            let report = session.tensor_backward(sum).unwrap();
+            assert!(report.gradient(first).unwrap().is_empty());
+            assert!(report.gradient(second).unwrap().is_empty());
+            vector_to_parameters(&mut session, vector, &[first, second]).unwrap();
+        }
+    }
+
+    #[test]
+    fn parameters_to_vector_preflights_before_mutating_the_graph() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let first = session
+            .tensor_variable(vec![1.0, 2.0], vec![1, 2], true)
+            .unwrap();
+        let different = loss_test_tensor(&mut session, vec![3.0], vec![1], DType::F32, true);
+        let count = session.autograd_graph_node_count();
+        assert!(parameters_to_vector(&mut session, &[first, different]).is_err());
+        assert_eq!(session.autograd_graph_node_count(), count);
+        assert!(parameters_to_vector(&mut session, &[first, TensorNodeId(usize::MAX)]).is_err());
+        assert_eq!(session.autograd_graph_node_count(), count);
+    }
+
+    #[test]
+    fn vector_to_parameters_invalidates_saved_forward_versions() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let parameter = session
+            .tensor_variable(vec![2.0, 3.0], vec![2], true)
+            .unwrap();
+        let square = session.tensor_square(parameter).unwrap();
+        let loss = session.tensor_sum(square).unwrap();
+        let vector = session
+            .tensor_variable(vec![4.0, 5.0], vec![2], false)
+            .unwrap();
+        vector_to_parameters(&mut session, vector, &[parameter]).unwrap();
+        assert!(session.tensor_backward(loss).is_err());
+    }
+
     // ── LSTM Module Tests ──────────────────────────────────────────────
 
     #[test]
@@ -43065,11 +43348,7 @@ mod tests {
                         .enumerate()
                         .map(|(i, value)| value * scales[(i / 3) % 3])
                         .collect();
-                    assert_loss_values(
-                        report.gradient(lp).unwrap(),
-                        &expected_gradient,
-                        dtype,
-                    );
+                    assert_loss_values(report.gradient(lp).unwrap(), &expected_gradient, dtype);
                     for label in [targets, input_lengths, target_lengths] {
                         assert!(report.gradient(label).is_none());
                     }
@@ -43101,15 +43380,23 @@ mod tests {
                 dtype,
                 true,
             );
-            let concatenated = session.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
-            let padded = session.tensor_variable(vec![0.0, 0.0], vec![1, 2], false).unwrap();
+            let concatenated = session
+                .tensor_variable(vec![0.0, 0.0], vec![2], false)
+                .unwrap();
+            let padded = session
+                .tensor_variable(vec![0.0, 0.0], vec![1, 2], false)
+                .unwrap();
             let il = session.tensor_variable(vec![3.0], vec![], false).unwrap();
             let tl = session.tensor_variable(vec![2.0], vec![], false).unwrap();
             let module = CTCLoss::new()
                 .with_blank(2)
                 .with_reduction(CTCReduction::None);
-            let loss = module.forward_ctc(&mut session, lp, concatenated, il, tl).unwrap();
-            let functional = session.tensor_ctc_loss(lp, padded, il, tl, 2, "none", false).unwrap();
+            let loss = module
+                .forward_ctc(&mut session, lp, concatenated, il, tl)
+                .unwrap();
+            let functional = session
+                .tensor_ctc_loss(lp, padded, il, tl, 2, "none", false)
+                .unwrap();
             assert!(session.tensor_shape(loss).unwrap().is_empty());
             assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
             assert_eq!(
@@ -43146,8 +43433,12 @@ mod tests {
                 let targets = session
                     .tensor_variable(vec![1.0, 99.0, 1.0, 2.0, 1.0, 1.0], vec![3, 2], false)
                     .unwrap();
-                let il = session.tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false).unwrap();
-                let tl = session.tensor_variable(vec![1.0, 2.0, 2.0], vec![3], false).unwrap();
+                let il = session
+                    .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
+                    .unwrap();
+                let tl = session
+                    .tensor_variable(vec![1.0, 2.0, 2.0], vec![3], false)
+                    .unwrap();
                 let loss = CTCLoss::new()
                     .with_zero_infinity(true)
                     .forward_ctc(&mut session, lp, targets, il, tl)
@@ -43164,27 +43455,42 @@ mod tests {
         for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
             for dtype in [DType::F32, DType::F64] {
                 let mut session = FrankenTorchSession::new(mode);
-                let logits = loss_test_tensor(&mut session, vec![0.0; 9], vec![3, 1, 3], dtype, true);
-                let targets = session.tensor_variable(vec![1.0, 1.0], vec![1, 2], false).unwrap();
+                let logits =
+                    loss_test_tensor(&mut session, vec![0.0; 9], vec![3, 1, 3], dtype, true);
+                let targets = session
+                    .tensor_variable(vec![1.0, 1.0], vec![1, 2], false)
+                    .unwrap();
                 let il = session.tensor_variable(vec![3.0], vec![1], false).unwrap();
                 let tl = session.tensor_variable(vec![2.0], vec![1], false).unwrap();
                 let module = CTCLoss::new();
                 let lp = session.tensor_log_softmax(logits, 2).unwrap();
-                let loss = module.forward_ctc(&mut session, lp, targets, il, tl).unwrap();
+                let loss = module
+                    .forward_ctc(&mut session, lp, targets, il, tl)
+                    .unwrap();
                 let initial = session.tensor_values_lossy_f64(loss).unwrap()[0];
                 assert_loss_values(&[initial], &[1.5 * 3.0_f64.ln()], dtype);
                 let report = session.tensor_backward(loss).unwrap();
                 let expected = [
-                    1.0 / 6.0, -1.0 / 3.0, 1.0 / 6.0,
-                    -1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0,
-                    1.0 / 6.0, -1.0 / 3.0, 1.0 / 6.0,
+                    1.0 / 6.0,
+                    -1.0 / 3.0,
+                    1.0 / 6.0,
+                    -1.0 / 3.0,
+                    1.0 / 6.0,
+                    1.0 / 6.0,
+                    1.0 / 6.0,
+                    -1.0 / 3.0,
+                    1.0 / 6.0,
                 ];
                 let gradient = report.gradient(logits).unwrap();
                 assert_loss_values(gradient, &expected, dtype);
                 let updated = gradient.iter().map(|value| -0.3 * value).collect();
-                session.with_no_grad(|session| session.tensor_update_param_values(logits, updated)).unwrap();
+                session
+                    .with_no_grad(|session| session.tensor_update_param_values(logits, updated))
+                    .unwrap();
                 let next_lp = session.tensor_log_softmax(logits, 2).unwrap();
-                let next = module.forward_ctc(&mut session, next_lp, targets, il, tl).unwrap();
+                let next = module
+                    .forward_ctc(&mut session, next_lp, targets, il, tl)
+                    .unwrap();
                 assert!(session.tensor_values_lossy_f64(next).unwrap()[0] < initial);
             }
         }
