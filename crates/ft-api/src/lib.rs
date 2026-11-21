@@ -18721,9 +18721,9 @@ impl FrankenTorchSession {
             ));
         }
         let lp_shape = self.tensor_shape(log_probs)?;
-        let (t_len, batch_size, num_classes, unbatched) = match lp_shape.as_slice() {
-            &[time, classes] => (time, 1, classes, true),
-            &[time, batch, classes] => (time, batch, classes, false),
+        let (t_len, batch_size, num_classes, unbatched) = match *lp_shape.as_slice() {
+            [time, classes] => (time, 1, classes, true),
+            [time, batch, classes] => (time, batch, classes, false),
             _ => {
                 return Err(Self::incompatible_tensor_args(
                     "ctc_loss: log_probs must be (T, C) or (T, N, C)",

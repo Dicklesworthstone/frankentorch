@@ -1566,7 +1566,13 @@ fn complex_narrow_vjp_preserves_both_lanes_on_every_axis() {
                 let numel: usize = shape.iter().product();
                 let seed: Vec<_> = (0..2 * numel).map(|i| (i + 1) as f64 / 4.0).collect();
                 let gradients = session
-                    .tensor_autograd_grad(&[view], &[re, im], Some(&[seed.clone()]), false, false)
+                    .tensor_autograd_grad(
+                        &[view],
+                        &[re, im],
+                        Some(std::slice::from_ref(&seed)),
+                        false,
+                        false,
+                    )
                     .unwrap();
                 let mut expected_real = vec![0.0; 24];
                 let mut expected_imag = vec![0.0; 24];
