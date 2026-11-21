@@ -85632,193 +85632,93 @@ impl FrankenTorchSession {
 
     /// `torch.fft.irfft2(input, s, norm=norm)`. Inverse 2-D real FFT; rescales
     /// by the real output size N = out_rows*out_cols: backward x1 (the inverse
-    /// already carries 1/N), forward xN, ortho x√N.
+    /// already carries 1/N), forward xN, ortho x√N. Explicit signal sizes are
+    /// differentiable. F32/Complex64 input produces F32 output; F64/Complex128
+    /// input produces F64 output, including inside `no_grad`.
     pub fn tensor_irfft2_norm(
         &mut self,
         input: TensorNodeId,
         s: Option<(usize, usize)>,
         norm: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled() {
-            if s.is_some() {
-                // The explicit-output-size path resizes via the non-autograd-aware
-                // tensor_resize_with_pad_or_crop; fail loud rather than silent-drop.
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "irfft2: autograd with explicit output size (s=) not yet supported",
-                    },
-                )));
-            }
-            // Autograd (frankentorch-ng1hw): irfft2 over the last two dims is exactly
-            // the 2-D case of the already-differentiable irfftn (last dim Hermitian,
-            // second-to-last a full complex inverse). Delegate the grad path there.
-            let ndim = self.tensor_shape(input)?.len();
-            if ndim < 2 {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "irfft2: input must be at least 2-D",
-                    },
-                )));
-            }
-            let dims = [ndim - 2, ndim - 1];
-            return self.tensor_irfftn_norm(input, None, Some(&dims), norm);
-        }
         let dtype = self.tensor_dtype(input)?;
-        if dtype != DType::Complex128 && dtype != DType::Complex64 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "irfft2: input must be complex",
-                },
-            )));
-        }
-
+        let output_dtype = match dtype {
+            DType::F32 | DType::Complex64 => DType::F32,
+            DType::F64 | DType::Complex128 => DType::F64,
+            _ => {
+                return Err(Self::incompatible_tensor_args(
+                    "irfft2: input must be f32, f64, complex64 or complex128",
+                ));
+            }
+        };
         let shape = self.tensor_shape(input)?;
         if shape.len() < 2 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "irfft2: input must be at least 2-D",
-                },
-            )));
+            return Err(Self::incompatible_tensor_args(
+                "irfft2: input must be at least 2-D",
+            ));
         }
-
-        let real_view = self.tensor_view_as_real(input)?;
-        let vals = self.tensor_values(real_view)?;
-
-        let ndim = shape.len();
-        let rows = shape[ndim - 2];
-        let in_cols = shape[ndim - 1];
-        let (out_rows, out_cols) = s.unwrap_or((rows, (in_cols - 1) * 2));
-        let batch_size: usize = shape[..ndim - 2].iter().product();
-        let factor = Self::fft_norm_factor(norm, out_rows * out_cols, true)?;
-
-        let mut re_full = vec![0.0_f64; batch_size * out_rows * out_cols];
-        let mut im_full = vec![0.0_f64; batch_size * out_rows * out_cols];
-
-        // Reconstruct full spectrum using conjugate symmetry along last dim
-        for b in 0..batch_size {
-            for r in 0..rows.min(out_rows) {
-                // Copy input frequencies
-                for c in 0..in_cols.min(out_cols) {
-                    let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
-                    let out_idx = b * out_rows * out_cols + r * out_cols + c;
-                    re_full[out_idx] = vals[in_idx];
-                    im_full[out_idx] = vals[in_idx + 1];
-                }
-                // Mirror for remaining columns: X[N-k] = conj(X[k])
-                for c in 1..in_cols.min(out_cols) {
-                    let mirror = out_cols - c;
-                    if mirror < out_cols && mirror >= in_cols {
-                        let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
-                        let out_idx = b * out_rows * out_cols + r * out_cols + mirror;
-                        re_full[out_idx] = vals[in_idx];
-                        im_full[out_idx] = -vals[in_idx + 1];
-                    }
-                }
+        let dims = [shape.len() - 2, shape.len() - 1];
+        let sizes = s.map(|(rows, columns)| [rows, columns]);
+        let sizes = sizes.as_ref().map(<[usize; 2]>::as_slice);
+        let (_, _, n_total) = Self::fft_nd_shape_and_dims(&shape, sizes, Some(&dims), true)?;
+        Self::fft_norm_factor(norm, n_total, true)?;
+        // The complex bridge kernels consume compact storage. A dim-0 narrow
+        // can retain an offset and a larger backing allocation, and imported
+        // tensors may have arbitrary strides. Materialize their logical values
+        // before promotion or Fourier transforms, with an identity adjoint so
+        // the original view remains connected to its source parameters.
+        let compact = {
+            let source = self.tensor_tape.tensor(input)?;
+            let meta = source.meta();
+            if meta.is_contiguous()
+                && meta.storage_offset() == 0
+                && source.typed_storage().len() == meta.numel()
+            {
+                None
+            } else {
+                let storage =
+                    match dtype {
+                        DType::F32 => TensorStorage::F32(Arc::new(vec![0.0; meta.numel()])),
+                        DType::F64 => TensorStorage::F64(Arc::new(vec![0.0; meta.numel()])),
+                        DType::Complex64 => TensorStorage::Complex64(Arc::new(vec![
+                        ft_core::Complex64::new(0.0, 0.0);
+                        meta.numel()
+                    ])),
+                        DType::Complex128 => TensorStorage::Complex128(Arc::new(vec![
+                        Complex128::new(0.0, 0.0);
+                        meta.numel()
+                    ])),
+                        _ => unreachable!("irfft2 dtype was validated above"),
+                    };
+                let mut compact = DenseTensor::from_typed_storage(
+                    TensorMeta::from_shape(shape.clone(), dtype, meta.device()),
+                    storage,
+                )?;
+                compact.copy_values_from(source)?;
+                Some(compact)
             }
-        }
-
-        let plane = out_rows * out_cols;
-        let parallel = batch_size * plane >= PARALLEL_ELEMENTWISE_MIN;
-
-        // Inverse FFT along rows (second-to-last dim). Columns are strided, so
-        // distribute the batch planes (each a contiguous out_rows*out_cols block)
-        // across workers, each reusing one scratch column buffer. Bit-for-bit
-        // identical to the serial loop.
-        if parallel && batch_size >= 2 {
-            use rayon::prelude::*;
-            re_full
-                .par_chunks_mut(plane)
-                .zip(im_full.par_chunks_mut(plane))
-                .for_each(|(re_b, im_b)| {
-                    let mut re_col = vec![0.0_f64; out_rows];
-                    let mut im_col = vec![0.0_f64; out_rows];
-                    for c in 0..out_cols {
-                        for r in 0..out_rows {
-                            re_col[r] = re_b[r * out_cols + c];
-                            im_col[r] = im_b[r * out_cols + c];
-                        }
-                        Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
-                        for r in 0..out_rows {
-                            re_b[r * out_cols + c] = re_col[r];
-                            im_b[r * out_cols + c] = im_col[r];
-                        }
-                    }
-                });
-        } else if parallel && out_rows >= 2 && batch_size == 1 {
-            // Single plane (batch==1): the `out_cols` column (second-to-last-dim) inverse transforms
-            // are independent — distribute across workers (gather strided column -> owned scratch ->
-            // SAME dft_inplace_1d(inverse) -> scatter back to disjoint indices). Bit-for-bit identical
-            // to the serial loop. Mirrors the rfft2/fft2 single-plane lever.
-            use rayon::prelude::*;
-            let cols_out: Vec<(Vec<f64>, Vec<f64>)> = (0..out_cols)
-                .into_par_iter()
-                .map(|c| {
-                    let mut re_col = vec![0.0_f64; out_rows];
-                    let mut im_col = vec![0.0_f64; out_rows];
-                    for r in 0..out_rows {
-                        re_col[r] = re_full[r * out_cols + c];
-                        im_col[r] = im_full[r * out_cols + c];
-                    }
-                    Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
-                    (re_col, im_col)
-                })
-                .collect();
-            for (c, (re_col, im_col)) in cols_out.iter().enumerate() {
-                for r in 0..out_rows {
-                    re_full[r * out_cols + c] = re_col[r];
-                    im_full[r * out_cols + c] = im_col[r];
-                }
+        };
+        let input = match compact {
+            Some(compact) => {
+                self.tensor_tape
+                    .apply_complex_bridge(&[input], compact, |_ctx, gradients| {
+                        Ok(vec![Some(gradients[0].to_vec())])
+                    })?
             }
-        } else {
-            for b in 0..batch_size {
-                for c in 0..out_cols {
-                    let mut re_col = vec![0.0_f64; out_rows];
-                    let mut im_col = vec![0.0_f64; out_rows];
-                    for r in 0..out_rows {
-                        re_col[r] = re_full[b * out_rows * out_cols + r * out_cols + c];
-                        im_col[r] = im_full[b * out_rows * out_cols + r * out_cols + c];
-                    }
-                    Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
-                    for r in 0..out_rows {
-                        re_full[b * out_rows * out_cols + r * out_cols + c] = re_col[r];
-                        im_full[b * out_rows * out_cols + r * out_cols + c] = im_col[r];
-                    }
-                }
-            }
-        }
-
-        // Inverse FFT along columns (last dim). Each (b, r) row is a contiguous
-        // out_cols block; run the transform in place across workers (only the
-        // real part is kept, so the discarded imaginary write is harmless).
-        if parallel && batch_size * out_rows >= 2 {
-            use rayon::prelude::*;
-            re_full
-                .par_chunks_mut(out_cols)
-                .zip(im_full.par_chunks_mut(out_cols))
-                .for_each(|(re_row, im_row)| {
-                    Self::dft_inplace_1d(re_row, im_row, true);
-                });
-        } else {
-            for b in 0..batch_size {
-                for r in 0..out_rows {
-                    let start = b * out_rows * out_cols + r * out_cols;
-                    let mut re_row: Vec<f64> = re_full[start..start + out_cols].to_vec();
-                    let mut im_row: Vec<f64> = im_full[start..start + out_cols].to_vec();
-                    Self::dft_inplace_1d(&mut re_row, &mut im_row, true);
-                    re_full[start..start + out_cols].copy_from_slice(&re_row);
-                }
-            }
-        }
-
-        if factor != 1.0 {
-            for v in re_full.iter_mut() {
-                *v *= factor;
-            }
-        }
-        let mut out_shape = shape[..ndim - 2].to_vec();
-        out_shape.push(out_rows);
-        out_shape.push(out_cols);
-        self.tensor_variable(re_full, out_shape, false)
+            None => input,
+        };
+        // Validate the entire request before promoting real inputs. As in
+        // PyTorch's fft_irfft2 -> fft_irfftn, use one implementation for all
+        // gradient modes. Inverting the other axis before extending the last
+        // one preserves the cross-axis Hermitian conjugation; same-row mirror
+        // reconstruction is wrong when the other axis has more than two bins.
+        let complex = match dtype {
+            DType::F32 => self.tensor_cfloat(input)?,
+            DType::F64 => self.tensor_cdouble(input)?,
+            _ => input,
+        };
+        let output = self.tensor_irfftn_norm(complex, sizes, Some(&dims), norm)?;
+        self.tensor_to_dtype(output, output_dtype)
     }
 
     /// Compute the N-dimensional Discrete Fourier Transform.
@@ -162700,7 +162600,7 @@ mod tests {
     }
 
     #[test]
-    fn irfft2_parallel_match_serial_bit_exact() {
+    fn irfft2_large_batch_matches_hermitian_reference() {
         use super::FrankenTorchSession;
         let (batch, rows, in_cols) = (4usize, 32usize, 33usize); // out 64, total 8192
         let out_rows = rows;
@@ -162719,7 +162619,10 @@ mod tests {
             vals[k * 2 + 1] = im_in[k];
         }
 
-        // Serial reference reproducing tensor_irfft2 exactly.
+        // Reconstruct the full Fourier plane independently of the production
+        // separable irfftn path. Hermitian partners reflect BOTH frequency
+        // coordinates. The old reference mirrored within the same row and
+        // therefore repeated the production bug it was supposed to catch.
         let mut re_full = vec![0.0f64; batch * plane];
         let mut im_full = vec![0.0f64; batch * plane];
         for b in 0..batch {
@@ -162734,7 +162637,8 @@ mod tests {
                     let mirror = out_cols - c;
                     if mirror < out_cols && mirror >= in_cols {
                         let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
-                        let out_idx = b * plane + r * out_cols + mirror;
+                        let mirror_row = (out_rows - r) % out_rows;
+                        let out_idx = b * plane + mirror_row * out_cols + mirror;
                         re_full[out_idx] = vals[in_idx];
                         im_full[out_idx] = -vals[in_idx + 1];
                     }
@@ -162778,7 +162682,10 @@ mod tests {
         let got = s.tensor_values(y).unwrap();
         assert_eq!(got.len(), re_full.len(), "irfft2 output length");
         for (idx, (g, w)) in got.iter().zip(re_full.iter()).enumerate() {
-            assert_eq!(g.to_bits(), w.to_bits(), "irfft2 @{idx}");
+            assert!(
+                (g - w).abs() <= 1e-10 * (1.0 + w.abs()),
+                "irfft2 @{idx}: got {g}, expected Hermitian reference {w}"
+            );
         }
     }
 

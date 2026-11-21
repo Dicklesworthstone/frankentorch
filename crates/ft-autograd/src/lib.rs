@@ -15689,6 +15689,24 @@ impl TensorTape {
                         dim,
                         "narrow backward shape volume overflow",
                     )?;
+                    // Complex cotangents store real/imaginary lanes adjacent
+                    // to each logical element. Treat those lanes as one extra
+                    // innermost dimension when scattering the narrowed slice.
+                    let lanes = if self.nodes[node_id.0].tensor.meta().dtype().is_complex() {
+                        2
+                    } else {
+                        1
+                    };
+                    let inner_size = Self::checked_mul_usize(
+                        inner_size,
+                        lanes,
+                        "narrow backward gradient stride overflow",
+                    )?;
+                    let orig_numel = Self::checked_mul_usize(
+                        orig_numel,
+                        lanes,
+                        "narrow backward gradient size overflow",
+                    )?;
                     let mut contrib = vec![0.0; orig_numel];
                     let output_shape = self.nodes[node_id.0].tensor.meta().shape();
                     let length = output_shape[dim];

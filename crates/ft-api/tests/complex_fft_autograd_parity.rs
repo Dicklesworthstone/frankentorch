@@ -1024,3 +1024,577 @@ fn hermitian_fft_preflights_shapes_dtypes_and_scalar_inputs() {
         );
     }
 }
+
+#[test]
+fn irfft2_sizes_precision_and_gradients_match_direct_dft() {
+    // Three rows expose cross-axis conjugation: unlike length two, frequency
+    // row one must pair with a DIFFERENT row. Include arbitrary boundary bins,
+    // odd output widths, simultaneous crop/pad, and a length-one transform.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for input_shape in [vec![3, 3], vec![2, 3, 3]] {
+                let input_len: usize = input_shape.iter().product();
+                let rank = input_shape.len();
+                let dims = [rank - 2, rank - 1];
+                let real: Vec<_> = (0..input_len)
+                    .map(|i| ((i * 7 % 19) as f64 - 9.0) / 8.0)
+                    .collect();
+                let imag: Vec<_> = (0..input_len)
+                    .map(|i| ((i * 3 % 17) as f64 - 8.0) / 4.0)
+                    .collect();
+                for norm in ["backward", "forward", "ortho"] {
+                    for sizes in [None, Some((2, 5)), Some((4, 6)), Some((1, 1))] {
+                        let (rows, columns) = sizes.unwrap_or((3, 4));
+                        let mut logical_shape = input_shape.clone();
+                        logical_shape[rank - 2] = rows;
+                        logical_shape[rank - 1] = columns;
+                        let (output_shape, expected, _) = direct_nd_dft(
+                            NdFft::RealInverse,
+                            &real,
+                            &imag,
+                            &input_shape,
+                            &logical_shape,
+                            &dims,
+                            norm,
+                        );
+                        // Frozen inputs, trainable inputs, and trainable inputs
+                        // inside no_grad must all have the same forward meaning.
+                        for execution in 0..3 {
+                            let mut session = FrankenTorchSession::new(mode);
+                            let requires_grad = execution != 0;
+                            let (re, im) = if dtype == DType::F32 {
+                                (
+                                    session.tensor_variable_f32(
+                                        real.iter().map(|&x| x as f32).collect(),
+                                        input_shape.clone(),
+                                        requires_grad,
+                                    ),
+                                    session.tensor_variable_f32(
+                                        imag.iter().map(|&x| x as f32).collect(),
+                                        input_shape.clone(),
+                                        requires_grad,
+                                    ),
+                                )
+                            } else {
+                                (
+                                    session.tensor_variable(
+                                        real.clone(),
+                                        input_shape.clone(),
+                                        requires_grad,
+                                    ),
+                                    session.tensor_variable(
+                                        imag.clone(),
+                                        input_shape.clone(),
+                                        requires_grad,
+                                    ),
+                                )
+                            };
+                            let (re, im) = (re.unwrap(), im.unwrap());
+                            let input = session.tensor_complex(re, im).unwrap();
+                            let output = if execution == 2 {
+                                session.with_no_grad(|session| {
+                                    session.tensor_irfft2_norm(input, sizes, norm)
+                                })
+                            } else if norm == "backward" {
+                                session.tensor_irfft2(input, sizes)
+                            } else {
+                                session.tensor_irfft2_norm(input, sizes, norm)
+                            }
+                            .unwrap();
+                            let label = format!(
+                                "{mode:?} {dtype:?} {input_shape:?} {sizes:?} {norm} execution={execution}"
+                            );
+                            let tolerance = if dtype == DType::F32 { 6e-6 } else { 1e-9 };
+                            assert_eq!(
+                                session.tensor_shape(output).unwrap(),
+                                output_shape,
+                                "{label}"
+                            );
+                            assert_eq!(session.tensor_dtype(output).unwrap(), dtype, "{label}");
+                            assert_eq!(
+                                session.tensor_requires_grad(output).unwrap(),
+                                execution == 1,
+                                "{label}"
+                            );
+                            assert_fft_close(
+                                &label,
+                                &session.tensor_values_lossy_f64(output).unwrap(),
+                                &expected,
+                                tolerance,
+                            );
+                            if execution != 1 {
+                                continue;
+                            }
+                            let weights: Vec<_> = (0..expected.len())
+                                .map(|i| (i % 7) as f64 / 4.0 - 0.5)
+                                .collect();
+                            let weight = session
+                                .tensor_variable(weights.clone(), output_shape.clone(), false)
+                                .unwrap();
+                            let weight = session.tensor_to_dtype(weight, dtype).unwrap();
+                            let weighted = session.tensor_mul(output, weight).unwrap();
+                            let loss = session.tensor_sum(weighted).unwrap();
+                            let report = session.tensor_backward(loss).unwrap();
+                            for (parameter, imaginary) in [(re, false), (im, true)] {
+                                let expected_gradient: Vec<_> = (0..input_len)
+                                    .map(|position| {
+                                        let mut basis = vec![0.0; input_len];
+                                        basis[position] = 1.0;
+                                        let zeros = vec![0.0; input_len];
+                                        let (real_basis, imag_basis) = if imaginary {
+                                            (&zeros, &basis)
+                                        } else {
+                                            (&basis, &zeros)
+                                        };
+                                        let (_, values, _) = direct_nd_dft(
+                                            NdFft::RealInverse,
+                                            real_basis,
+                                            imag_basis,
+                                            &input_shape,
+                                            &logical_shape,
+                                            &dims,
+                                            norm,
+                                        );
+                                        values.iter().zip(&weights).map(|(y, w)| y * w).sum::<f64>()
+                                    })
+                                    .collect();
+                                assert_fft_close(
+                                    &label,
+                                    session.tensor_gradient(&report, parameter).unwrap(),
+                                    &expected_gradient,
+                                    tolerance,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn irfft2_real_input_promotion_preserves_precision_and_gradients() {
+    // PyTorch promotes real spectra to complex before the inverse transform.
+    // Check that this promotion is differentiable and does not promote F32
+    // models to F64 output, including when gradient recording is disabled.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for norm in ["backward", "forward", "ortho"] {
+                let mut session = FrankenTorchSession::new(mode);
+                let values: Vec<_> = (0..9).map(|i| i as f64 / 4.0 - 1.0).collect();
+                let input = session
+                    .tensor_variable(values.clone(), vec![3, 3], true)
+                    .unwrap();
+                let input = session.tensor_to_dtype(input, dtype).unwrap();
+                let output = session
+                    .tensor_irfft2_norm(input, Some((3, 5)), norm)
+                    .unwrap();
+                let (_, expected, _) = direct_nd_dft(
+                    NdFft::RealInverse,
+                    &values,
+                    &[0.0; 9],
+                    &[3, 3],
+                    &[3, 5],
+                    &[0, 1],
+                    norm,
+                );
+                let tolerance = if dtype == DType::F32 { 6e-6 } else { 1e-9 };
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                assert_fft_close(
+                    "real irfft2 promotion",
+                    &session.tensor_values_lossy_f64(output).unwrap(),
+                    &expected,
+                    tolerance,
+                );
+                let weights: Vec<_> = (0..15).map(|i| (i % 5) as f64 / 4.0 - 0.5).collect();
+                let weight = session
+                    .tensor_variable(weights.clone(), vec![3, 5], false)
+                    .unwrap();
+                let weight = session.tensor_to_dtype(weight, dtype).unwrap();
+                let weighted = session.tensor_mul(output, weight).unwrap();
+                let loss = session.tensor_sum(weighted).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                let expected_gradient: Vec<_> = (0..9)
+                    .map(|i| {
+                        let mut basis = vec![0.0; 9];
+                        basis[i] = 1.0;
+                        let (_, y, _) = direct_nd_dft(
+                            NdFft::RealInverse,
+                            &basis,
+                            &[0.0; 9],
+                            &[3, 3],
+                            &[3, 5],
+                            &[0, 1],
+                            norm,
+                        );
+                        y.iter().zip(&weights).map(|(y, w)| y * w).sum::<f64>()
+                    })
+                    .collect();
+                assert_fft_close(
+                    "real irfft2 adjoint",
+                    session.tensor_gradient(&report, input).unwrap(),
+                    &expected_gradient,
+                    tolerance,
+                );
+                let frozen = session
+                    .with_no_grad(|session| session.tensor_irfft2_norm(input, Some((3, 5)), norm))
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(frozen).unwrap());
+                assert_eq!(session.tensor_dtype(frozen).unwrap(), dtype);
+                assert_fft_close(
+                    "real irfft2 no_grad",
+                    &session.tensor_values_lossy_f64(frozen).unwrap(),
+                    &expected,
+                    tolerance,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn irfft2_preserves_empty_batches_and_preflights_invalid_arguments() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            let mut session = FrankenTorchSession::new(mode);
+            let empty = session
+                .tensor_variable(vec![], vec![0, 3, 3], true)
+                .unwrap();
+            let empty = session.tensor_to_dtype(empty, dtype).unwrap();
+            let spectrum = session.tensor_complex(empty, empty).unwrap();
+            let output = session
+                .tensor_irfft2_norm(spectrum, Some((4, 5)), "ortho")
+                .unwrap();
+            assert_eq!(session.tensor_shape(output).unwrap(), vec![0, 4, 5]);
+            assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+            let loss = session.tensor_sum(output).unwrap();
+            let report = session.tensor_backward(loss).unwrap();
+            assert!(session.tensor_gradient(&report, empty).unwrap().is_empty());
+        }
+
+        let mut session = FrankenTorchSession::new(mode);
+        let real = session
+            .tensor_variable(vec![1.0; 9], vec![3, 3], true)
+            .unwrap();
+        let spectrum = session.tensor_complex(real, real).unwrap();
+        let scalar = session.tensor_variable(vec![1.0], vec![], true).unwrap();
+        let singleton = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let scalar = session.tensor_complex(scalar, scalar).unwrap();
+        let singleton = session.tensor_complex(singleton, singleton).unwrap();
+        let initial_nodes = session.autograd_graph_node_count();
+        for (sizes, norm) in [
+            (Some((0, 4)), "backward"),
+            (Some((3, 0)), "backward"),
+            (Some((usize::MAX, 4)), "backward"),
+            (None, "invalid"),
+        ] {
+            assert!(session.tensor_irfft2_norm(spectrum, sizes, norm).is_err());
+            assert!(session.tensor_irfft2_norm(real, sizes, norm).is_err());
+        }
+        for invalid in [scalar, singleton] {
+            assert!(session.tensor_irfft2(invalid, None).is_err());
+        }
+        assert_eq!(session.autograd_graph_node_count(), initial_nodes);
+    }
+}
+
+#[test]
+fn irfft2_offset_and_strided_views_preserve_values_and_gradients() {
+    use ft_core::{Complex64, Complex128, DenseTensor, Device, TensorMeta};
+
+    let real: Vec<_> = (0..9).map(|i| i as f64 / 4.0 - 1.0).collect();
+    let imag: Vec<_> = (0..9).map(|i| (i % 5) as f64 / 8.0 - 0.25).collect();
+    let weights: Vec<_> = (0..15).map(|i| (i % 7) as f64 / 4.0 - 0.5).collect();
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for complex in [false, true] {
+                let input_imag = if complex { imag.clone() } else { vec![0.0; 9] };
+                let (_, expected, _) = direct_nd_dft(
+                    NdFft::RealInverse,
+                    &real,
+                    &input_imag,
+                    &[3, 3],
+                    &[3, 5],
+                    &[0, 1],
+                    "ortho",
+                );
+                let mut expected_gradient = Vec::new();
+                for position in 0..9 {
+                    for component in 0..if complex { 2 } else { 1 } {
+                        let mut basis = vec![0.0; 9];
+                        basis[position] = 1.0;
+                        let zeros = vec![0.0; 9];
+                        let (re, im) = if component == 0 {
+                            (&basis, &zeros)
+                        } else {
+                            (&zeros, &basis)
+                        };
+                        let (_, output, _) = direct_nd_dft(
+                            NdFft::RealInverse,
+                            re,
+                            im,
+                            &[3, 3],
+                            &[3, 5],
+                            &[0, 1],
+                            "ortho",
+                        );
+                        expected_gradient
+                            .push(output.iter().zip(&weights).map(|(y, w)| y * w).sum::<f64>());
+                    }
+                }
+                for strided in [false, true] {
+                    let (strides, offset) = if strided {
+                        (vec![1, 4], 2)
+                    } else {
+                        (vec![3, 1], 9)
+                    };
+                    let source_dtype = match (dtype, complex) {
+                        (DType::F32, true) => DType::Complex64,
+                        (DType::F64, true) => DType::Complex128,
+                        _ => dtype,
+                    };
+                    let meta = TensorMeta::from_shape_and_strides(
+                        vec![3, 3],
+                        strides.clone(),
+                        offset,
+                        source_dtype,
+                        Device::Cpu,
+                    )
+                    .unwrap();
+                    // Values outside the view are deliberately unlike its logical data.
+                    let mut physical_real = vec![91.0; 18];
+                    let mut physical_imag = vec![-37.0; 18];
+                    for row in 0..3 {
+                        for col in 0..3 {
+                            let physical = offset + row * strides[0] + col * strides[1];
+                            physical_real[physical] = real[row * 3 + col];
+                            physical_imag[physical] = input_imag[row * 3 + col];
+                        }
+                    }
+                    let source = match source_dtype {
+                        DType::F32 => DenseTensor::from_storage_f32(
+                            meta.clone(),
+                            physical_real.iter().map(|&x| x as f32).collect(),
+                        ),
+                        DType::F64 => {
+                            DenseTensor::from_storage(meta.clone(), physical_real.clone())
+                        }
+                        DType::Complex64 => DenseTensor::from_storage_complex64(
+                            meta.clone(),
+                            physical_real
+                                .iter()
+                                .zip(&physical_imag)
+                                .map(|(&re, &im)| Complex64::new(re as f32, im as f32))
+                                .collect(),
+                        ),
+                        DType::Complex128 => DenseTensor::from_storage_complex128(
+                            meta.clone(),
+                            physical_real
+                                .iter()
+                                .zip(&physical_imag)
+                                .map(|(&re, &im)| Complex128::new(re, im))
+                                .collect(),
+                        ),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                    for execution in 0..3 {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let input =
+                            session.tensor_variable_from_storage(source.clone(), execution != 0);
+                        let output = if execution == 2 {
+                            session.with_no_grad(|s| {
+                                s.tensor_irfft2_norm(input, Some((3, 5)), "ortho")
+                            })
+                        } else {
+                            session.tensor_irfft2_norm(input, Some((3, 5)), "ortho")
+                        }
+                        .unwrap();
+                        let label = format!(
+                            "{mode:?} {source_dtype:?}, strided={strided}, execution={execution}"
+                        );
+                        let tolerance = if dtype == DType::F32 { 6e-6 } else { 1e-9 };
+                        assert_eq!(session.tensor_dtype(output).unwrap(), dtype, "{label}");
+                        assert_eq!(
+                            session.tensor_requires_grad(output).unwrap(),
+                            execution == 1,
+                            "{label}"
+                        );
+                        assert!(session.is_grad_enabled());
+                        assert_eq!(session.tensor_snapshot(input).unwrap().meta(), &meta);
+                        assert_fft_close(
+                            &label,
+                            &session.tensor_values_lossy_f64(output).unwrap(),
+                            &expected,
+                            tolerance,
+                        );
+                        if execution == 1 {
+                            let weight = session
+                                .tensor_variable(weights.clone(), vec![3, 5], false)
+                                .unwrap();
+                            let weight = session.tensor_to_dtype(weight, dtype).unwrap();
+                            let product = session.tensor_mul(output, weight).unwrap();
+                            let loss = session.tensor_sum(product).unwrap();
+                            let report = session.tensor_backward(loss).unwrap();
+                            assert_fft_close(
+                                &label,
+                                report.gradient(input).unwrap(),
+                                &expected_gradient,
+                                tolerance,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn irfft2_narrow_views_backpropagate_to_full_parameters() {
+    let base_real: Vec<_> = (0..18).map(|i| i as f64 / 4.0 - 2.0).collect();
+    let base_imag: Vec<_> = (0..18).map(|i| (i % 7) as f64 / 8.0 - 0.5).collect();
+    let weights: Vec<_> = (0..12).map(|i| (i % 5) as f64 / 4.0 - 0.25).collect();
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for complex in [false, true] {
+                for start in [0, 1] {
+                    let mut session = FrankenTorchSession::new(mode);
+                    let re = session
+                        .tensor_variable(base_real.clone(), vec![2, 3, 3], true)
+                        .unwrap();
+                    let re = session.tensor_to_dtype(re, dtype).unwrap();
+                    let im = session
+                        .tensor_variable(base_imag.clone(), vec![2, 3, 3], true)
+                        .unwrap();
+                    let im = session.tensor_to_dtype(im, dtype).unwrap();
+                    let base = if complex {
+                        session.tensor_complex(re, im).unwrap()
+                    } else {
+                        re
+                    };
+                    let view = session.tensor_narrow(base, 0, start, 1).unwrap();
+                    let output = session.tensor_irfft2(view, None).unwrap();
+                    let input_imag = if complex {
+                        base_imag[start * 9..start * 9 + 9].to_vec()
+                    } else {
+                        vec![0.0; 9]
+                    };
+                    let (_, expected, _) = direct_nd_dft(
+                        NdFft::RealInverse,
+                        &base_real[start * 9..start * 9 + 9],
+                        &input_imag,
+                        &[1, 3, 3],
+                        &[1, 3, 4],
+                        &[1, 2],
+                        "backward",
+                    );
+                    let tolerance = if dtype == DType::F32 { 6e-6 } else { 1e-9 };
+                    let label =
+                        format!("{mode:?} {dtype:?}, complex={complex}, narrow start={start}");
+                    assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                    assert_fft_close(
+                        &label,
+                        &session.tensor_values_lossy_f64(output).unwrap(),
+                        &expected,
+                        tolerance,
+                    );
+                    let weight = session
+                        .tensor_variable(weights.clone(), vec![1, 3, 4], false)
+                        .unwrap();
+                    let weight = session.tensor_to_dtype(weight, dtype).unwrap();
+                    let product = session.tensor_mul(output, weight).unwrap();
+                    let loss = session.tensor_sum(product).unwrap();
+                    let report = session.tensor_backward(loss).unwrap();
+                    for (parameter, imaginary) in [(re, false), (im, true)] {
+                        if imaginary && !complex {
+                            continue;
+                        }
+                        let mut expected_gradient = vec![0.0; 18];
+                        for position in 0..9 {
+                            let mut basis = vec![0.0; 9];
+                            basis[position] = 1.0;
+                            let zeros = vec![0.0; 9];
+                            let (real, imag) = if imaginary {
+                                (&zeros, &basis)
+                            } else {
+                                (&basis, &zeros)
+                            };
+                            let (_, values, _) = direct_nd_dft(
+                                NdFft::RealInverse,
+                                real,
+                                imag,
+                                &[1, 3, 3],
+                                &[1, 3, 4],
+                                &[1, 2],
+                                "backward",
+                            );
+                            expected_gradient[start * 9 + position] =
+                                values.iter().zip(&weights).map(|(y, w)| y * w).sum();
+                        }
+                        assert_fft_close(
+                            &label,
+                            report.gradient(parameter).unwrap(),
+                            &expected_gradient,
+                            tolerance,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn complex_narrow_vjp_preserves_both_lanes_on_every_axis() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for dim in 0..3 {
+                let mut session = FrankenTorchSession::new(mode);
+                let re = session
+                    .tensor_variable(vec![1.0; 24], vec![2, 3, 4], true)
+                    .unwrap();
+                let re = session.tensor_to_dtype(re, dtype).unwrap();
+                let im = session
+                    .tensor_variable(vec![2.0; 24], vec![2, 3, 4], true)
+                    .unwrap();
+                let im = session.tensor_to_dtype(im, dtype).unwrap();
+                let base = session.tensor_complex(re, im).unwrap();
+                let view = session.tensor_narrow(base, dim, 1, 1).unwrap();
+                let shape = session.tensor_shape(view).unwrap();
+                let numel: usize = shape.iter().product();
+                let seed: Vec<_> = (0..2 * numel).map(|i| (i + 1) as f64 / 4.0).collect();
+                let gradients = session
+                    .tensor_autograd_grad(&[view], &[re, im], Some(&[seed.clone()]), false, false)
+                    .unwrap();
+                let mut expected_real = vec![0.0; 24];
+                let mut expected_imag = vec![0.0; 24];
+                for source in 0..24 {
+                    let mut coord = coordinates(source, &[2, 3, 4]);
+                    if coord[dim] == 1 {
+                        coord[dim] = 0;
+                        let destination = coord
+                            .iter()
+                            .zip(&shape)
+                            .fold(0, |flat, (&c, &size)| flat * size + c);
+                        expected_real[source] = seed[2 * destination];
+                        expected_imag[source] = seed[2 * destination + 1];
+                    }
+                }
+                assert_fft_close(
+                    "complex narrow real VJP",
+                    gradients[0].as_deref().unwrap(),
+                    &expected_real,
+                    0.0,
+                );
+                assert_fft_close(
+                    "complex narrow imaginary VJP",
+                    gradients[1].as_deref().unwrap(),
+                    &expected_imag,
+                    0.0,
+                );
+            }
+        }
+    }
+}
