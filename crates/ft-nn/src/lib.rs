@@ -18090,18 +18090,7 @@ impl LossModule for KLDivLoss {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        // KL(P || Q) = sum(P * (log(P) - log(Q)))
-        // input = log(Q), target = P
-        // loss = mean(target * (log(target) - input))
-        // We add eps to target before log to avoid log(0)
-        let eps = 1e-8;
-        let shape = session.tensor_shape(target)?;
-        let eps_tensor = session.full(shape, eps, false)?;
-        let target_safe = session.tensor_add(target, eps_tensor)?;
-        let log_target = session.tensor_log(target_safe)?;
-        let diff = session.tensor_sub(log_target, input)?;
-        let weighted = session.tensor_mul(target, diff)?;
-        session.tensor_mean(weighted)
+        session.kl_div_loss(input, target, "mean", false)
     }
 }
 
@@ -32425,6 +32414,44 @@ mod tests {
         let loss = loss_fn.forward(&mut session, log_q, p).expect("loss");
         let report = session.tensor_backward(loss).expect("backward");
         assert!(session.tensor_gradient(&report, log_q).is_some());
+    }
+
+    #[test]
+    fn kl_div_loss_module_preserves_typed_zero_target_training() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                let input =
+                    loss_test_tensor(&mut session, vec![-3.0, -1.0, -2.0], vec![3], dtype, true);
+                let target =
+                    loss_test_tensor(&mut session, vec![0.0, 0.25, 0.75], vec![3], dtype, false);
+                let loss = KLDivLoss.forward(&mut session, input, target).unwrap();
+                assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
+                let expected = (0.25 * (0.25_f64.ln() + 1.0) + 0.75 * (0.75_f64.ln() + 2.0)) / 3.0;
+                assert_loss_values(
+                    &session.tensor_values_lossy_f64(loss).unwrap(),
+                    &[expected],
+                    dtype,
+                );
+                let report = session.tensor_backward(loss).unwrap();
+                assert_loss_values(
+                    report.gradient(input).unwrap(),
+                    &[0.0, -1.0 / 12.0, -0.25],
+                    dtype,
+                );
+                assert!(report.gradient(target).is_none());
+                let inferred = session
+                    .with_no_grad(|session| KLDivLoss.forward(session, input, target))
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(inferred).unwrap());
+                assert_eq!(session.tensor_dtype(inferred).unwrap(), dtype);
+                assert_loss_values(
+                    &session.tensor_values_lossy_f64(inferred).unwrap(),
+                    &[expected],
+                    dtype,
+                );
+            }
+        }
     }
 
     // ── Container Module Tests ─────────────────────────────────────────
