@@ -1709,7 +1709,7 @@ fn complex_components_read_offset_views_and_route_weighted_gradients() {
                         .tensor_autograd_grad(
                             &[output],
                             &[re, im],
-                            Some(&[weights.clone()]),
+                            Some(std::slice::from_ref(&weights)),
                             false,
                             false,
                         )
@@ -1827,7 +1827,13 @@ fn complex_view_roundtrip_reads_legal_strides_and_rejects_invalid_layouts_atomic
             );
             let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let gradients = session
-                .tensor_autograd_grad(&[output], &[input], Some(&[weights.clone()]), false, false)
+                .tensor_autograd_grad(
+                    &[output],
+                    &[input],
+                    Some(std::slice::from_ref(&weights)),
+                    false,
+                    false,
+                )
                 .unwrap();
             assert_close(
                 "strided view roundtrip VJP",

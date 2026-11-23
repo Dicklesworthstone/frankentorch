@@ -124,12 +124,7 @@ impl SparseMatmulPlan {
 
     // Shape, coordinate and allocation bounds are checked before recording.
     // The tape stores cotangents in F64 independently of the forward dtype.
-    fn evaluate(
-        &self,
-        contraction: SparseMatmulContraction,
-        lhs: &[f64],
-        rhs: &[f64],
-    ) -> Vec<f64> {
+    fn evaluate(&self, contraction: SparseMatmulContraction, lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
         let mut output = vec![0.0; self.output_shape(contraction).iter().product()];
         for (entry, &[row, column]) in self.coordinates.iter().enumerate() {
             for feature in 0..self.columns {
@@ -209,9 +204,8 @@ impl SparseMatmulPlan {
                     .iter()
                     .enumerate()
                     .map(|(slot, &(adjoint, lhs, rhs))| {
-                        ctx.needs_input_grad()[slot].then(|| {
-                            backward_plan.evaluate(adjoint, operands[lhs], operands[rhs])
-                        })
+                        ctx.needs_input_grad()[slot]
+                            .then(|| backward_plan.evaluate(adjoint, operands[lhs], operands[rhs]))
                     })
                     .collect())
             },
@@ -224,8 +218,7 @@ impl SparseMatmulPlan {
                     if ctx.needs_input_grad()[slot] {
                         let lhs = tape.to_dtype(operands[lhs], DType::F64)?;
                         let rhs = tape.to_dtype(operands[rhs], DType::F64)?;
-                        result[slot] =
-                            Some(graph_plan.record(tape, adjoint, [lhs, rhs], None)?);
+                        result[slot] = Some(graph_plan.record(tape, adjoint, [lhs, rhs], None)?);
                     }
                 }
                 Ok(result)
@@ -16869,67 +16862,189 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Validate classification shapes without recording casts or view nodes.
+    /// Returns the unreduced loss shape, its element count and the class count.
+    fn classification_loss_layout(
+        &self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        soft_target: bool,
+        reduction: &str,
+    ) -> Result<(Vec<usize>, usize, usize), AutogradError> {
+        if !matches!(reduction, "none" | "mean" | "sum") {
+            return Err(Self::incompatible_tensor_args(
+                "classification loss: reduction must be 'none', 'mean', or 'sum'",
+            ));
+        }
+        let input_meta = self.tensor_tape.tensor_meta(input)?;
+        let target_meta = self.tensor_tape.tensor_meta(target)?;
+        let shape = input_meta.shape();
+        if shape.is_empty() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::InvalidDimension { dim: 0, ndim: 0 },
+            )));
+        }
+        if !input_meta.dtype().is_floating_point()
+            || !target_meta.dtype().is_floating_point()
+            || input_meta.device() != target_meta.device()
+        {
+            return Err(Self::incompatible_tensor_args(
+                "classification loss: input and target must be real floating tensors on the same device",
+            ));
+        }
+        let (loss_shape, classes) = if shape.len() == 1 {
+            (Vec::new(), shape[0])
+        } else {
+            let mut loss_shape = vec![shape[0]];
+            loss_shape.extend_from_slice(&shape[2..]);
+            (loss_shape, shape[1])
+        };
+        let expected_target = if soft_target { shape } else { &loss_shape };
+        if target_meta.shape() != expected_target {
+            return Err(Self::incompatible_tensor_args(
+                "classification loss: target shape must match the input without its class axis, or the complete input for probabilities",
+            ));
+        }
+        let positions = Self::checked_shape_numel(
+            &loss_shape,
+            "classification loss: target shape volume overflow",
+        )?;
+        positions.checked_mul(classes).ok_or_else(|| {
+            Self::incompatible_tensor_args("classification loss: input shape volume overflow")
+        })?;
+        Ok((loss_shape, positions, classes))
+    }
+
+    fn classification_weight_preflight(
+        &self,
+        input: TensorNodeId,
+        weight: Option<TensorNodeId>,
+        classes: usize,
+    ) -> Result<(), AutogradError> {
+        if let Some(weight) = weight {
+            let meta = self.tensor_tape.tensor_meta(weight)?;
+            if meta.shape() != [classes]
+                || !meta.dtype().is_floating_point()
+                || meta.device() != self.tensor_device(input)?
+            {
+                return Err(Self::incompatible_tensor_args(
+                    "classification loss: weight must be a real floating tensor of shape [C] on the input device",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn classification_hard_targets(
+        &self,
+        target: TensorNodeId,
+        classes: usize,
+        ignore_index: Option<i64>,
+    ) -> Result<(Vec<f64>, Vec<f64>), AutogradError> {
+        let values = self
+            .tensor_tape
+            .compact_tensor(target)?
+            .contiguous_values_as_f64()?;
+        let mut indices = Vec::with_capacity(values.len());
+        let mut keep = Vec::with_capacity(values.len());
+        for value in values {
+            // Check before casting: NaN and fractional negatives must not
+            // masquerade as an ignored integer or silently truncate to a class.
+            if !value.is_finite() || value.fract() != 0.0 {
+                return Err(Self::incompatible_tensor_args(
+                    "classification loss: target indices must be finite integers",
+                ));
+            }
+            if ignore_index.is_some_and(|ignore| value == ignore as f64) {
+                indices.push(0.0);
+                keep.push(0.0);
+                continue;
+            }
+            let class = Self::exact_nonnegative_index_to_usize(
+                value,
+                "classification loss: target indices must be finite non-negative integers",
+            )?;
+            if class >= classes {
+                return Err(Self::incompatible_tensor_args(
+                    "classification loss: target class index out of range",
+                ));
+            }
+            indices.push(value);
+            keep.push(1.0);
+        }
+        Ok((indices, keep))
+    }
+
+    /// Move the class axis to the end and flatten independent observations.
+    /// Existing permutation/reshape adjoints restore the original layout.
+    fn classification_flatten_classes(
+        &mut self,
+        input: TensorNodeId,
+        positions: usize,
+        classes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input = self.tensor_contiguous(input)?;
+        let rank = self.tensor_shape(input)?.len();
+        let input = if rank > 2 {
+            let mut axes = vec![0];
+            axes.extend(2..rank);
+            axes.push(1);
+            self.tensor_permute(input, axes)?
+        } else {
+            input
+        };
+        let shape = vec![positions, classes];
+        if self.tensor_shape(input)? == shape {
+            Ok(input)
+        } else {
+            self.tensor_reshape(input, shape)
+        }
+    }
+
+    fn classification_flatten_targets(
+        &mut self,
+        target: TensorNodeId,
+        positions: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let target = self.tensor_contiguous(target)?;
+        if self.tensor_shape(target)? == [positions] {
+            Ok(target)
+        } else {
+            self.tensor_reshape(target, vec![positions])
+        }
+    }
+
+    fn classification_restore_loss(
+        &mut self,
+        loss: TensorNodeId,
+        reduction: &str,
+        shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = if reduction == "none" {
+            shape
+        } else {
+            Vec::new()
+        };
+        if self.tensor_shape(loss)? != shape {
+            self.tensor_reshape(loss, shape)
+        } else {
+            Ok(loss)
+        }
+    }
+
     /// Negative log likelihood loss.
     ///
     /// Equivalent to `torch.nn.functional.nll_loss(input, target, reduction)`.
     /// Input should be log-probabilities from log_softmax.
-    /// Target contains class indices (not one-hot encoded).
+    /// Target contains class indices (not one-hot encoded). Accepts [C] with a
+    /// scalar target or [N, C, ...] with [N, ...] targets; -100 is ignored.
     pub fn tensor_nll_loss(
         &mut self,
         input: TensorNodeId,
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input = self.maybe_autocast_fp32(input)?;
-        let input_shape = self.tensor_shape(input)?;
-        let target_shape = self.tensor_shape(target)?;
-        if input_shape.len() != 2 || target_shape.len() != 1 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: input must be 2D (N, C), target must be 1D (N,)",
-                },
-            )));
-        }
-        if input_shape[0] != target_shape[0] {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: batch size mismatch",
-                },
-            )));
-        }
-        let n = input_shape[0];
-        let c = input_shape[1];
-        let target_vals = self.tensor_values_lossy_f64(target)?;
-        for &t in &target_vals {
-            let class_idx = t as usize;
-            if class_idx >= c {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "nll_loss: target class index out of range",
-                    },
-                )));
-            }
-        }
-        // Autograd-aware: gather the per-sample log-prob at the target class via
-        // the autograd-tracked tensor_gather, then negate — the gradient scatters
-        // −grad back to input[i, target[i]]. The previous body extracted values
-        // and rebuilt a requires_grad=false leaf, silently severing the gradient
-        // of nll_loss (and hence cross_entropy / functional_cross_entropy).
-        // The gathered value is the same scalar, so the forward is bit-identical.
-        let index = self.tensor_variable(target_vals, vec![n, 1], false)?;
-        let gathered = self.tensor_gather(input, 1, index)?; // [n, 1]
-        let neg = self.tensor_neg(gathered)?;
-        let loss = self.tensor_reshape(neg, vec![n])?; // [n]
-        match reduction {
-            "none" => Ok(loss),
-            "mean" => self.tensor_mean(loss),
-            "sum" => self.tensor_sum(loss),
-            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: reduction must be 'none', 'mean', or 'sum'",
-                },
-            ))),
-        }
+        self.tensor_nll_loss_full(input, target, None, Some(-100), reduction)
     }
 
     /// `torch.nn.functional.nll_loss` with optional per-class `weight` (shape
@@ -16948,102 +17063,95 @@ impl FrankenTorchSession {
         ignore_index: Option<i64>,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let (loss_shape, n, c) =
+            self.classification_loss_layout(input, target, false, reduction)?;
+        self.classification_weight_preflight(input, weight, c)?;
+        let (safe_idx, mask) = self.classification_hard_targets(target, c, ignore_index)?;
         let input = self.maybe_autocast_fp32(input)?;
-        let weight = weight.map(|w| self.maybe_autocast_fp32(w)).transpose()?;
-        if !matches!(reduction, "none" | "mean" | "sum") {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: reduction must be 'none', 'mean', or 'sum'",
-                },
-            )));
-        }
-        let input_shape = self.tensor_shape(input)?;
-        let target_shape = self.tensor_shape(target)?;
-        if input_shape.len() != 2 || target_shape.len() != 1 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: input must be 2D (N, C), target must be 1D (N,)",
-                },
-            )));
-        }
-        if input_shape[0] != target_shape[0] {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: batch size mismatch",
-                },
-            )));
-        }
-        let n = input_shape[0];
-        let c = input_shape[1];
-        if let Some(w) = weight
-            && self.tensor_shape(w)? != vec![c]
-        {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss: weight must have shape [C]",
-                },
-            )));
-        }
-        // Split targets into a gather-safe class index (ignored -> 0, masked out)
-        // and a 0/1 keep-mask.
-        let target_vals = self.tensor_values_lossy_f64(target)?;
-        let mut safe_idx: Vec<f64> = Vec::with_capacity(n);
-        let mut mask: Vec<f64> = Vec::with_capacity(n);
-        for &t in &target_vals {
-            #[allow(clippy::cast_possible_truncation)]
-            let ti = t as i64;
-            if ignore_index == Some(ti) {
-                safe_idx.push(0.0);
-                mask.push(0.0);
-            } else {
-                if ti < 0 || (ti as usize) >= c {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "nll_loss: target class index out of range",
-                        },
-                    )));
-                }
-                safe_idx.push(t);
-                mask.push(1.0);
+        let input = self.classification_flatten_classes(input, n, c)?;
+        let weight = weight
+            .map(|w| {
+                let w = self.maybe_autocast_fp32(w)?;
+                self.tensor_contiguous(w)
+            })
+            .transpose()?;
+        let kept: f64 = mask.iter().sum();
+        if c == 0 {
+            // Validation permits no active class index when C=0. Preserve the
+            // empty input/weight gradient edges without gathering column zero.
+            let mut zero = self.tensor_sum(input)?;
+            if let Some(weight) = weight {
+                let weight_zero = self.tensor_sum(weight)?;
+                zero = self.tensor_add(zero, weight_zero)?;
             }
+            let loss = match reduction {
+                "none" => self.tensor_expand(zero, vec![n])?,
+                "sum" => zero,
+                _ => {
+                    let nan = self.const_tensor_like(zero, vec![], f64::NAN)?;
+                    self.tensor_add(zero, nan)?
+                }
+            };
+            return self.classification_restore_loss(loss, reduction, loss_shape);
         }
         // nll_i = -input[i, target_i]
         let index = self.tensor_variable(safe_idx.clone(), vec![n, 1], false)?;
         let gathered = self.tensor_gather(input, 1, index)?;
         let neg = self.tensor_neg(gathered)?;
-        let nll = self.tensor_reshape(neg, vec![n])?;
-        // per-sample scale = mask_i * weight[target_i] (weight defaults to 1).
-        let (scale_t, denom) = if let Some(w) = weight {
+        let mut nll = self.tensor_reshape(neg, vec![n])?;
+        let mask_t = if kept != n as f64 {
+            let mask_t = self.tensor_variable(mask.clone(), vec![n], false)?;
+            let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(nll)?)?;
+            let zeros = self.zeros_like(nll, false)?;
+            nll = self.tensor_where(mask_t, nll, zeros)?;
+            Some(mask_t)
+        } else {
+            None
+        };
+        // Select before multiplying: ignored NaN log-probabilities or class
+        // weights must not contaminate a loss through 0 * NaN.
+        let (weighted, denom) = if let Some(w) = weight {
             let w_idx = self.tensor_variable(safe_idx.clone(), vec![n], false)?;
             let w_gathered = self.tensor_index_select(w, 0, w_idx)?;
-            let mask_t = self.tensor_variable(mask.clone(), vec![n], false)?;
-            let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(w)?)?;
-            let scale = self.tensor_mul(w_gathered, mask_t)?;
+            let scale = if let Some(mask_t) = mask_t {
+                let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(w_gathered)?)?;
+                let zeros = self.zeros_like(w_gathered, false)?;
+                self.tensor_where(mask_t, w_gathered, zeros)?
+            } else {
+                w_gathered
+            };
             let w_vals = self.tensor_values_lossy_f64(w)?;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let denom: f64 = (0..n).map(|i| mask[i] * w_vals[safe_idx[i] as usize]).sum();
-            (scale, denom)
+            let denom: f64 = (0..n)
+                .filter(|&i| mask[i] != 0.0)
+                .map(|i| w_vals[safe_idx[i] as usize])
+                .sum();
+            (self.tensor_mul(nll, scale)?, denom)
         } else {
-            let mask_t = self.tensor_variable(mask.clone(), vec![n], false)?;
-            let mask_t = self.tensor_to_dtype(mask_t, self.tensor_dtype(input)?)?;
-            let denom: f64 = mask.iter().sum();
-            (mask_t, denom)
+            (nll, kept)
         };
-        let weighted = self.tensor_mul(nll, scale_t)?;
-        match reduction {
-            "none" => Ok(weighted),
-            "sum" => self.tensor_sum(weighted),
+        let loss = match reduction {
+            "none" => weighted,
+            "sum" => self.tensor_sum(weighted)?,
             _ => {
-                // "mean": sum / denom (0/0 -> NaN for an all-ignored batch).
                 let sum = self.tensor_sum(weighted)?;
-                let denom_t = self.const_tensor_like(sum, vec![], denom)?;
-                self.tensor_div(sum, denom_t)
+                if kept == 0.0 {
+                    // Match NLL's NaN value and zero adjoint for an entirely
+                    // ignored/empty batch, without an artificial 0/0 derivative.
+                    let nan = self.const_tensor_like(sum, vec![], f64::NAN)?;
+                    self.tensor_add(sum, nan)?
+                } else {
+                    let denom_t = self.const_tensor_like(sum, vec![], denom)?;
+                    self.tensor_div(sum, denom_t)?
+                }
             }
-        }
+        };
+        self.classification_restore_loss(loss, reduction, loss_shape)
     }
 
-    /// `torch.nn.functional.cross_entropy` with optional per-class `weight` and
-    /// `ignore_index` (= `log_softmax` + [`Self::tensor_nll_loss_full`]).
+    /// Cross entropy with optional per-class weights and ignored hard targets.
+    /// Probability targets use the full input shape and a mean over observations;
+    /// a nonnegative ignore index is unsupported for probability targets.
     pub fn tensor_cross_entropy_full(
         &mut self,
         input: TensorNodeId,
@@ -17052,9 +17160,30 @@ impl FrankenTorchSession {
         ignore_index: Option<i64>,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        let soft_target = self.tensor_shape(input)? == self.tensor_shape(target)?;
+        if soft_target {
+            if ignore_index.is_some_and(|index| index >= 0) {
+                return Err(Self::incompatible_tensor_args(
+                    "cross_entropy: ignore_index is unsupported for probability targets",
+                ));
+            }
+            return self.classification_soft_cross_entropy(input, target, weight, reduction);
+        }
+        let (loss_shape, positions, classes) =
+            self.classification_loss_layout(input, target, false, reduction)?;
+        self.classification_weight_preflight(input, weight, classes)?;
+        self.classification_hard_targets(target, classes, ignore_index)?;
+        if classes == 0 {
+            return self.tensor_nll_loss_full(input, target, weight, ignore_index, reduction);
+        }
         let input = self.maybe_autocast_fp32(input)?;
+        let input = self.classification_flatten_classes(input, positions, classes)?;
+        let target = self.classification_flatten_targets(target, positions)?;
+        // Preserve log_softmax's own nonfinite derivative behavior. Ignoring a
+        // target selects away its NLL value, not the logits before normalization.
         let log_probs = self.tensor_log_softmax(input, 1)?;
-        self.tensor_nll_loss_full(log_probs, target, weight, ignore_index, reduction)
+        let loss = self.tensor_nll_loss_full(log_probs, target, weight, ignore_index, reduction)?;
+        self.classification_restore_loss(loss, reduction, loss_shape)
     }
 
     /// Cross entropy loss (log_softmax + nll_loss combined).
@@ -17062,7 +17191,7 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.nn.functional.cross_entropy(input, target, reduction)`.
     /// Input should be raw logits. Target contains class indices.
     /// Soft-label cross entropy: `torch.nn.functional.cross_entropy` with a
-    /// probability target of the same shape as `input` (`[N, C]`), used for label
+    /// probability target of the same shape as `input`, used for label
     /// smoothing, distillation, and mixup. Per sample
     /// `loss_i = -Σ_c target[i, c] · log_softmax(input)[i, c]`, then reduced
     /// (`mean` averages over the batch). A one-hot soft target reproduces the
@@ -17073,34 +17202,62 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
+        self.classification_soft_cross_entropy(input, target, None, reduction)
+    }
+
+    fn classification_soft_cross_entropy(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        weight: Option<TensorNodeId>,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (loss_shape, n, c) = self.classification_loss_layout(input, target, true, reduction)?;
+        self.classification_weight_preflight(input, weight, c)?;
         let input = self.maybe_autocast_fp32(input)?;
         let target = self.maybe_autocast_fp32(target)?;
-        if !matches!(reduction, "none" | "mean" | "sum") {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "cross_entropy: reduction must be 'none', 'mean', or 'sum'",
-                },
-            )));
+        let input = self.classification_flatten_classes(input, n, c)?;
+        let target = self.classification_flatten_classes(target, n, c)?;
+        if c == 0 {
+            // Probability-target CE normalizes by input_numel / C. With no
+            // classes its mean is NaN even for nonempty observation axes.
+            // Keep both empty operands' gradient edges without normalizing an
+            // empty class axis or manufacturing detached output values.
+            let input_zero = self.tensor_sum(input)?;
+            let target_zero = self.tensor_sum(target)?;
+            let mut zero = self.tensor_add(input_zero, target_zero)?;
+            if let Some(weight) = weight {
+                let weight = self.maybe_autocast_fp32(weight)?;
+                let weight = self.tensor_contiguous(weight)?;
+                let weight_zero = self.tensor_sum(weight)?;
+                zero = self.tensor_add(zero, weight_zero)?;
+            }
+            let loss = match reduction {
+                "none" => self.tensor_expand(zero, vec![n])?,
+                "sum" => zero,
+                _ => {
+                    let nan = self.const_tensor_like(zero, vec![], f64::NAN)?;
+                    self.tensor_add(zero, nan)?
+                }
+            };
+            return self.classification_restore_loss(loss, reduction, loss_shape);
         }
-        let in_shape = self.tensor_shape(input)?;
-        if in_shape.len() != 2 || self.tensor_shape(target)? != in_shape {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "cross_entropy: soft-label target must have the same [N, C] shape as input",
-                },
-            )));
-        }
-        let n = in_shape[0];
         let log_probs = self.tensor_log_softmax(input, 1)?; // [N, C]
-        let prod = self.tensor_mul(target, log_probs)?; // [N, C]
+        let mut prod = self.tensor_mul(target, log_probs)?; // [N, C]
+        if let Some(weight) = weight {
+            let weight = self.maybe_autocast_fp32(weight)?;
+            let weight = self.tensor_contiguous(weight)?;
+            prod = self.tensor_mul(prod, weight)?;
+        }
         let summed = self.tensor_sum_dim(prod, 1)?; // [N] (or [N,1])
         let summed = self.tensor_reshape(summed, vec![n])?;
         let per_sample = self.tensor_neg(summed)?; // [N]
-        match reduction {
-            "none" => Ok(per_sample),
-            "sum" => self.tensor_sum(per_sample),
-            _ => self.tensor_mean(per_sample),
-        }
+        let loss = match reduction {
+            "none" => per_sample,
+            "sum" => self.tensor_sum(per_sample)?,
+            _ => self.tensor_mean(per_sample)?,
+        };
+        self.classification_restore_loss(loss, reduction, loss_shape)
     }
 
     /// Soft-target (distillation) cross-entropy from teacher *logits*: per sample
@@ -17308,14 +17465,21 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input = self.maybe_autocast_fp32(input)?;
-        // Soft-label form: a probability target matching the input's [N, C] shape
-        // (torch auto-detects this vs a [N] class-index target). Distillation /
-        // mixup / label-smoothing all pass soft labels here.
-        let in_shape = self.tensor_shape(input)?;
-        if in_shape.len() == 2 && self.tensor_shape(target)? == in_shape {
+        // Same-shaped probability targets are recognized for unbatched and
+        // spatial inputs too. All hard-target validation precedes AMP/views.
+        if self.tensor_shape(input)? == self.tensor_shape(target)? {
             return self.tensor_cross_entropy_soft(input, target, reduction);
         }
+        let (loss_shape, positions, classes) =
+            self.classification_loss_layout(input, target, false, reduction)?;
+        let (_, keep) = self.classification_hard_targets(target, classes, Some(-100))?;
+        if classes == 0 || keep.contains(&0.0) {
+            return self.tensor_cross_entropy_full(input, target, None, Some(-100), reduction);
+        }
+        let input = self.maybe_autocast_fp32(input)?;
+        let input = self.classification_flatten_classes(input, positions, classes)?;
+        let target = self.classification_flatten_targets(target, positions)?;
+        let in_shape = self.tensor_shape(input)?;
         // Fused fast path: 2-D f64 logits with an in-range class-index target
         // [batch]. Computes per-row loss (lse - logits[target]) directly, never
         // materialising the [batch, classes] log-softmax tensor (nor its backward
@@ -17376,11 +17540,12 @@ impl FrankenTorchSession {
                     };
                     self.tensor_variable(loss, vec![batch], false)?
                 };
-                return match reduction {
-                    "none" => Ok(per_row),
-                    "mean" => self.tensor_mean(per_row),
-                    _ => self.tensor_sum(per_row),
+                let loss = match reduction {
+                    "none" => per_row,
+                    "mean" => self.tensor_mean(per_row)?,
+                    _ => self.tensor_sum(per_row)?,
                 };
+                return self.classification_restore_loss(loss, reduction, loss_shape);
             }
         }
         // f32 fused fast path (dominant ML dtype): same streaming per-row
@@ -17446,16 +17611,18 @@ impl FrankenTorchSession {
                     };
                     self.tensor_variable_f32(loss, vec![batch], false)?
                 };
-                return match reduction {
-                    "none" => Ok(per_row),
-                    "mean" => self.tensor_mean(per_row),
-                    _ => self.tensor_sum(per_row),
+                let loss = match reduction {
+                    "none" => per_row,
+                    "mean" => self.tensor_mean(per_row)?,
+                    _ => self.tensor_sum(per_row)?,
                 };
+                return self.classification_restore_loss(loss, reduction, loss_shape);
             }
         }
 
         let log_probs = self.tensor_log_softmax(input, 1)?;
-        self.tensor_nll_loss(log_probs, target, reduction)
+        let loss = self.tensor_nll_loss(log_probs, target, reduction)?;
+        self.classification_restore_loss(loss, reduction, loss_shape)
     }
 
     /// Cross-entropy with label smoothing, matching
@@ -17472,7 +17639,6 @@ impl FrankenTorchSession {
         label_smoothing: f64,
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input = self.maybe_autocast_fp32(input)?;
         if !(0.0..=1.0).contains(&label_smoothing) {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -17483,25 +17649,72 @@ impl FrankenTorchSession {
         if label_smoothing == 0.0 {
             return self.tensor_cross_entropy(input, target, reduction);
         }
+        let soft_target = self.tensor_shape(input)? == self.tensor_shape(target)?;
+        let (loss_shape, positions, classes) =
+            self.classification_loss_layout(input, target, soft_target, reduction)?;
+        let keep = if soft_target {
+            None
+        } else {
+            Some(
+                self.classification_hard_targets(target, classes, Some(-100))?
+                    .1,
+            )
+        };
+        let input = self.maybe_autocast_fp32(input)?;
+        if soft_target {
+            let target = self.maybe_autocast_fp32(target)?;
+            let target = self.tensor_contiguous(target)?;
+            let scaled = self.tensor_mul_scalar(target, 1.0 - label_smoothing)?;
+            let uniform = self.const_tensor_like(
+                target,
+                self.tensor_shape(target)?,
+                label_smoothing / classes as f64,
+            )?;
+            let smoothed = self.tensor_add(scaled, uniform)?;
+            return self.tensor_cross_entropy_soft(input, smoothed, reduction);
+        }
+        if classes == 0 {
+            // With hard targets, PyTorch's smoothing contribution contains
+            // epsilon / C. It therefore makes reduced losses NaN even when
+            // every target is ignored; the empty input adjoint remains empty.
+            let loss = self.tensor_nll_loss_full(input, target, None, Some(-100), reduction)?;
+            let nan = self.const_tensor_like(loss, self.tensor_shape(loss)?, f64::NAN)?;
+            return self.tensor_add(loss, nan);
+        }
+        let input = self.classification_flatten_classes(input, positions, classes)?;
+        let target = self.classification_flatten_targets(target, positions)?;
         let log_probs = self.tensor_log_softmax(input, 1)?;
         // Per-sample negative log-likelihood at the target class.
         let nll = self.tensor_nll_loss(log_probs, target, "none")?;
         // Per-sample smoothing term: −mean over the class dimension of log_p.
         let mean_lp = self.tensor_mean_dim(log_probs, 1)?;
-        let smooth = self.tensor_neg(mean_lp)?;
+        let mut smooth = self.tensor_neg(mean_lp)?;
+        let keep = keep.expect("hard targets were validated before recording nodes");
+        let kept: f64 = keep.iter().sum();
+        if kept != positions as f64 {
+            let mask = self.tensor_variable(keep, vec![positions], false)?;
+            let mask = self.tensor_to_dtype(mask, self.tensor_dtype(smooth)?)?;
+            let zeros = self.zeros_like(smooth, false)?;
+            smooth = self.tensor_where(mask, smooth, zeros)?;
+        }
         let nll_w = self.tensor_mul_scalar(nll, 1.0 - label_smoothing)?;
         let smooth_w = self.tensor_mul_scalar(smooth, label_smoothing)?;
         let loss = self.tensor_add(nll_w, smooth_w)?;
-        match reduction {
-            "none" => Ok(loss),
-            "mean" => self.tensor_mean(loss),
-            "sum" => self.tensor_sum(loss),
-            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "cross_entropy: reduction must be 'none', 'mean', or 'sum'",
-                },
-            ))),
-        }
+        let loss = match reduction {
+            "none" => loss,
+            "sum" => self.tensor_sum(loss)?,
+            _ => {
+                let sum = self.tensor_sum(loss)?;
+                if kept == 0.0 {
+                    let nan = self.const_tensor_like(sum, vec![], f64::NAN)?;
+                    self.tensor_add(sum, nan)?
+                } else {
+                    let count = self.const_tensor_like(sum, vec![], kept)?;
+                    self.tensor_div(sum, count)?
+                }
+            }
+        };
+        self.classification_restore_loss(loss, reduction, loss_shape)
     }
 
     /// Kullback-Leibler divergence loss.
@@ -30106,8 +30319,8 @@ impl FrankenTorchSession {
     /// CE with soft labels: (1 - smoothing) * one_hot + smoothing / num_classes
     ///
     /// Args:
-    /// - logits: [N, C] unnormalized logits
-    /// - targets: [N] integer class indices
+    /// - logits: [C] or [N, C, ...] unnormalized logits
+    /// - targets: class indices with the class axis removed, or probabilities
     /// - smoothing: label smoothing factor (0 = no smoothing)
     pub fn label_smoothing_cross_entropy(
         &mut self,
@@ -30115,28 +30328,7 @@ impl FrankenTorchSession {
         targets: TensorNodeId,
         smoothing: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(logits)?;
-        if shape.len() != 2 {
-            return Err(Self::incompatible_tensor_args(
-                "label_smoothing_cross_entropy: logits must be [N, C]",
-            ));
-        }
-        let (n, c) = (shape[0], shape[1]);
-        let target_data = self.tensor_values(targets)?;
-        let mut soft_targets = vec![smoothing / c as f64; n * c];
-        let confidence = 1.0 - smoothing;
-        for i in 0..n {
-            let cls = target_data[i] as usize;
-            if cls < c {
-                soft_targets[i * c + cls] += confidence;
-            }
-        }
-        let soft_t = self.tensor_variable(soft_targets, vec![n, c], false)?;
-        let log_probs = self.tensor_log_softmax(logits, 1)?;
-        let neg_log_probs = self.tensor_neg(log_probs)?;
-        let losses = self.tensor_mul(soft_t, neg_log_probs)?;
-        let sum_losses = self.tensor_sum_dim(losses, 1)?;
-        self.tensor_mean(sum_losses)
+        self.cross_entropy_loss_with_smoothing(logits, targets, smoothing)
     }
 
     /// Shake-Shake regularization for ResNet branches.
@@ -66821,9 +67013,9 @@ impl FrankenTorchSession {
 
     /// Negative log likelihood loss.
     ///
-    /// Expects `log_probs` to be log-probabilities of shape [batch, classes] and
-    /// `targets` to be class indices of shape [batch] (as f64 values that will be
-    /// cast to usize). Returns the mean NLL loss.
+    /// Accepts unbatched [C] or batched [N, C, ...] log-probabilities and class
+    /// targets with the class axis removed. Returns the mean NLL loss, excluding
+    /// the default ignored target -100.
     ///
     /// NLL(x, y) = -mean(log_probs[i, targets[i]] for i in batch)
     pub fn nll_loss(
@@ -66831,56 +67023,7 @@ impl FrankenTorchSession {
         log_probs: TensorNodeId,
         targets: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let log_prob_shape = self.tensor_shape(log_probs)?;
-        let target_shape = self.tensor_shape(targets)?;
-        let target_vals = self.tensor_values(targets)?;
-
-        if log_prob_shape.len() != 2 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss expects 2-D log_probs [batch, classes]",
-                },
-            )));
-        }
-
-        let batch_size = log_prob_shape[0];
-        let num_classes = log_prob_shape[1];
-
-        if target_shape.len() != 1
-            || target_shape[0] != batch_size
-            || target_vals.len() != batch_size
-        {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "nll_loss expects targets shape [batch] matching log_probs batch",
-                },
-            )));
-        }
-
-        // Validate target indices
-        for &target in &target_vals {
-            let cls = Self::exact_nonnegative_index_to_usize(
-                target,
-                "nll_loss targets must be finite non-negative integer indices",
-            )?;
-            if cls >= num_classes {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "nll_loss target index out of bounds",
-                    },
-                )));
-            }
-        }
-
-        // Build index tensor of shape [batch_size, 1] for gather along dim=1
-        let index = self.tensor_variable(target_vals, vec![batch_size, 1], false)?;
-
-        // Gather log-probabilities at target indices (autograd-tracked)
-        let gathered = self.tensor_gather(log_probs, 1, index)?;
-
-        // NLL = -mean(gathered log-probabilities)
-        let neg_gathered = self.tensor_neg(gathered)?;
-        self.tensor_mean(neg_gathered)
+        self.tensor_nll_loss(log_probs, targets, "mean")
     }
 
     /// Conditional selection: `torch.where(condition, x, y)`.
@@ -69762,8 +69905,8 @@ impl FrankenTorchSession {
 
     /// Cross-entropy loss for classification.
     ///
-    /// Applies log_softmax to `logits` along the last dimension, then computes
-    /// NLL loss against `targets` (class indices as f64).
+    /// Uses class axis 0 for [C] logits and axis 1 for [N, C, ...] logits.
+    /// Targets may be class indices or probabilities with the input shape.
     ///
     /// Equivalent to PyTorch's `F.cross_entropy(logits, targets)`.
     pub fn cross_entropy_loss(
@@ -69788,36 +69931,12 @@ impl FrankenTorchSession {
         targets: TensorNodeId,
         label_smoothing: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(logits)?;
-        if shape.is_empty() {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::InvalidDimension { dim: 0, ndim: 0 },
-            )));
-        }
-        let last_dim = shape.len() - 1;
-        let log_probs = self.tensor_log_softmax(logits, last_dim)?;
-
         if label_smoothing == 0.0 {
-            return self.nll_loss(log_probs, targets);
+            // Retain the canonical alias's composed, higher-order gradient
+            // path while sharing class-axis and target validation.
+            return self.tensor_cross_entropy_full(logits, targets, None, Some(-100), "mean");
         }
-
-        // Smoothed cross-entropy:
-        // loss = (1 - s) * nll_loss(log_probs, targets) + s * (-mean(log_probs))
-        // Compose through tensor_lerp so the autograd tape carries
-        // gradients to log_probs (and hence back to logits). The
-        // previous body extracted scalar values + rebuilt a
-        // requires_grad=false leaf, silently severing autograd for
-        // the label-smoothing training path. Tracked under
-        // frankentorch-ilwr.
-        let nll = self.nll_loss(log_probs, targets)?;
-        let uniform_loss = {
-            let neg_log_probs = self.tensor_neg(log_probs)?;
-            self.tensor_mean(neg_log_probs)?
-        };
-        // tensor_lerp(start, end, w) = start * (1 - w) + end * w
-        // → blended = nll * (1 - s) + uniform_loss * s, exactly the
-        // smoothed-CE definition.
-        self.tensor_lerp(nll, uniform_loss, label_smoothing)
+        self.tensor_cross_entropy_label_smoothing(logits, targets, label_smoothing, "mean")
     }
 
     /// Return indices that would sort the tensor along a dimension.
@@ -90328,10 +90447,8 @@ impl FrankenTorchSession {
             false,
         )?;
         self.validate_sparse_matmul_grad_buffers(values, dense, shape)?;
-        let output = ft_kernel_cpu::sparse_coo_matmul_dense(
-            &sparse,
-            self.tensor_tape.tensor(dense)?,
-        )?;
+        let output =
+            ft_kernel_cpu::sparse_coo_matmul_dense(&sparse, self.tensor_tape.tensor(dense)?)?;
         let index_values = sparse.indices().contiguous_values()?;
         let nnz = sparse.nnz();
         let coordinates = (0..nnz)
@@ -90374,10 +90491,8 @@ impl FrankenTorchSession {
             shape,
         )?;
         self.validate_sparse_matmul_grad_buffers(values, dense, shape)?;
-        let output = ft_kernel_cpu::sparse_csr_matmul_dense(
-            &sparse,
-            self.tensor_tape.tensor(dense)?,
-        )?;
+        let output =
+            ft_kernel_cpu::sparse_csr_matmul_dense(&sparse, self.tensor_tape.tensor(dense)?)?;
         let crow = sparse.crow_indices().contiguous_values()?;
         let columns = sparse.col_indices().contiguous_values()?;
         let mut coordinates = Vec::with_capacity(sparse.nnz());
@@ -90415,8 +90530,7 @@ impl FrankenTorchSession {
                 "sparse mm requires a matrix RHS",
             ));
         };
-        let output_numel =
-            Self::checked_mul(shape[0], *columns, "sparse mm output overflow")?;
+        let output_numel = Self::checked_mul(shape[0], *columns, "sparse mm output overflow")?;
         let lanes = if values_tensor.meta().dtype().is_complex() {
             2
         } else {
@@ -90505,10 +90619,10 @@ impl FrankenTorchSession {
             &[values, dense],
             output,
             move |ctx, gradients| {
-                let mut value_gradient = ctx.needs_input_grad()[0]
-                    .then(|| vec![0.0; 2 * plan.coordinates.len()]);
-                let mut dense_gradient = ctx.needs_input_grad()[1]
-                    .then(|| vec![0.0; 2 * (plan.inner * plan.columns)]);
+                let mut value_gradient =
+                    ctx.needs_input_grad()[0].then(|| vec![0.0; 2 * plan.coordinates.len()]);
+                let mut dense_gradient =
+                    ctx.needs_input_grad()[1].then(|| vec![0.0; 2 * (plan.inner * plan.columns)]);
                 for (entry, &[row, column]) in plan.coordinates.iter().enumerate() {
                     for feature in 0..plan.columns {
                         let row_offset = row * plan.columns + feature;
@@ -90774,19 +90888,7 @@ impl FrankenTorchSession {
         labels: TensorNodeId,
         smoothing: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(logits)?;
-        if shape.len() != 2 {
-            return Err(Self::incompatible_tensor_args(
-                "cross_entropy_label_smoothing: logits must be [N, C]",
-            ));
-        }
-        let num_classes = shape[1];
-        let smooth_labels = self.smooth_labels(labels, num_classes, smoothing)?;
-        let log_softmax = self.tensor_log_softmax(logits, 1)?;
-        let loss = self.tensor_mul(smooth_labels, log_softmax)?;
-        let neg_loss = self.tensor_neg(loss)?;
-        let sum_loss = self.tensor_sum_dim(neg_loss, 1)?;
-        self.tensor_mean(sum_loss)
+        self.cross_entropy_loss_with_smoothing(logits, labels, smoothing)
     }
 
     // ── Modern Regularization ─────────────────────────────────────────────
@@ -167154,11 +167256,11 @@ mod tests {
     }
 
     #[test]
-    fn complex_session_ops_reject_non_complex_inputs() {
+    fn complex_session_real_input_behavior() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
 
-        assert!(s.tensor_real(input).is_err());
+        assert_eq!(s.tensor_real(input).unwrap(), input);
         assert!(s.tensor_imag(input).is_err());
         assert!(s.tensor_conj(input).is_err());
     }

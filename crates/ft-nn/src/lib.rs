@@ -17916,8 +17916,10 @@ impl LossModule for L1Loss {
 
 /// Cross-entropy loss module for classification.
 ///
-/// Applies log-softmax to `input` along the last dimension, then computes
-/// NLL loss against `target` (class indices as f64).
+/// Accepts unbatched `[C]` or batched/spatial `[N, C, ...]` logits, using
+/// class axis 0 or 1 respectively. Targets may be class indices with that
+/// axis removed, or probabilities with the input shape. Class index -100 is
+/// ignored; the result is a scalar mean loss.
 pub struct CrossEntropyLoss;
 
 impl LossModule for CrossEntropyLoss {
@@ -17933,8 +17935,8 @@ impl LossModule for CrossEntropyLoss {
 
 /// Negative log-likelihood loss module.
 ///
-/// Expects `input` to be log-probabilities of shape `[batch, classes]` and
-/// `target` to be class indices of shape `[batch]`.
+/// Accepts `[C]` or `[N, C, ...]` log-probabilities and class targets with the
+/// class axis removed. Class index -100 is ignored in the scalar mean loss.
 pub struct NLLLoss;
 
 impl LossModule for NLLLoss {
