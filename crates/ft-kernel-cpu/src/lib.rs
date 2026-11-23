@@ -3245,8 +3245,8 @@ pub fn set_mxcsr_default() {
 
 use ft_core::{
     Complex128, DType, DenseI64Tensor, DenseTensor, DenseTensorError, Device, ScalarTensor,
-    SparseCOOTensor, SparseTensorError, TensorCompatError, TensorMeta, TensorStorage,
-    ensure_compatible,
+    SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorCompatError, TensorMeta,
+    TensorStorage, ensure_compatible,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52369,16 +52369,11 @@ pub fn sparse_coo_matmul_dense_f64(
     Ok(output)
 }
 
-/// Typed sparse-dense matrix multiplication: sparse [M, K] @ dense [K, N].
+/// Multiply a scalar-valued sparse COO matrix [M, K] by a dense [K, N] matrix.
 ///
-/// Accepts scalar-valued 2D COO tensors with F64, F32, F16, BF16, Complex64
-/// or Complex128 values. Both operands must have the same dtype on the CPU.
-/// Logical offsets and strides are honored without materializing either input.
-///
-/// Entries are accumulated in their stored order, including duplicate indices
-/// and explicit zeros. Missing entries are never multiplied by dense NaN/Inf.
-/// Arithmetic stays in storage precision, including the product and each
-/// accumulation for F16/BF16, matching the CPU sparse COO AXPY contract.
+/// Both tensors must have the same floating-point or complex dtype on the CPU.
+/// Values and the dense operand may be strided or offset views. Duplicate COO
+/// entries contribute in their stored order; the sparse operand is not densified.
 pub fn sparse_coo_matmul_dense(
     sparse: &SparseCOOTensor,
     dense: &DenseTensor,
@@ -52394,149 +52389,212 @@ pub fn sparse_coo_matmul_dense(
             expected: 2,
         });
     }
-    let dense_meta = dense.meta();
-    if dense_meta.shape().len() != 2 {
-        return Err(SparseTensorError::UnsupportedRank {
-            rank: dense_meta.shape().len(),
-        });
+    let indices = sparse.indices().contiguous_values()?;
+    let nnz = sparse.nnz();
+    sparse_matmul_dense(
+        [sparse.dense_shape()[0], sparse.dense_shape()[1]],
+        SparseMatmulIndices::Coo {
+            rows: &indices[..nnz],
+            cols: &indices[nnz..],
+        },
+        sparse.values(),
+        dense,
+    )
+}
+
+/// Multiply a sparse CSR matrix [M, K] by a dense [K, N] matrix.
+///
+/// Supports the same dtypes and layouts as [`sparse_coo_matmul_dense`]. Each
+/// row's contributions retain their stored order, including unsorted columns.
+pub fn sparse_csr_matmul_dense(
+    sparse: &SparseCSRTensor,
+    dense: &DenseTensor,
+) -> Result<DenseTensor, SparseTensorError> {
+    sparse_matmul_dense(
+        sparse.shape(),
+        SparseMatmulIndices::Csr {
+            row_offsets: sparse.crow_indices().contiguous_values()?,
+            cols: sparse.col_indices().contiguous_values()?,
+        },
+        sparse.values(),
+        dense,
+    )
+}
+
+enum SparseMatmulIndices<'a> {
+    Coo {
+        rows: &'a [i64],
+        cols: &'a [i64],
+    },
+    Csr {
+        row_offsets: &'a [i64],
+        cols: &'a [i64],
+    },
+}
+
+impl SparseMatmulIndices<'_> {
+    fn for_each(&self, mut visit: impl FnMut(usize, usize, usize)) {
+        match self {
+            Self::Coo { rows, cols } => {
+                for (entry, (&row, &col)) in rows.iter().zip(*cols).enumerate() {
+                    // Sparse constructors already validate nonnegative bounds.
+                    visit(entry, row as usize, col as usize);
+                }
+            }
+            Self::Csr { row_offsets, cols } => {
+                for (row, bounds) in row_offsets.windows(2).enumerate() {
+                    let start = bounds[0] as usize;
+                    let end = bounds[1] as usize;
+                    for (offset, &col) in cols[start..end].iter().enumerate() {
+                        visit(start + offset, row, col as usize);
+                    }
+                }
+            }
+        }
     }
-    let dtype = sparse.dtype();
-    if dtype != dense_meta.dtype() {
-        return Err(SparseTensorError::DTypeMismatch {
-            expected: dtype,
-            actual: dense_meta.dtype(),
-        });
-    }
+}
+
+fn sparse_matmul_dense(
+    sparse_shape: [usize; 2],
+    indices: SparseMatmulIndices<'_>,
+    values: &DenseTensor,
+    dense: &DenseTensor,
+) -> Result<DenseTensor, SparseTensorError> {
+    let dtype = values.meta().dtype();
     if !dtype.is_floating_point() && !dtype.is_complex() {
         return Err(DenseTensorError::UnsupportedDType(dtype).into());
     }
-    if sparse.device() != dense_meta.device() {
-        return Err(SparseTensorError::DeviceMismatch {
-            expected: sparse.device(),
-            actual: dense_meta.device(),
+    if dense.meta().dtype() != dtype {
+        return Err(SparseTensorError::DTypeMismatch {
+            expected: dtype,
+            actual: dense.meta().dtype(),
         });
     }
-    if sparse.device() != Device::Cpu {
-        return Err(SparseTensorError::DeviceMismatch {
-            expected: Device::Cpu,
-            actual: sparse.device(),
+    for device in [values.meta().device(), dense.meta().device()] {
+        if device != Device::Cpu {
+            return Err(SparseTensorError::DeviceMismatch {
+                expected: Device::Cpu,
+                actual: device,
+            });
+        }
+    }
+    let dense_shape = dense.meta().shape();
+    if dense_shape.len() != 2 {
+        return Err(SparseTensorError::UnsupportedRank {
+            rank: dense_shape.len(),
         });
     }
-    let m = sparse.dense_shape()[0];
-    let k = sparse.dense_shape()[1];
-    let n = dense_meta.shape()[1];
-    if dense_meta.shape()[0] != k {
+    if sparse_shape[1] != dense_shape[0] {
         return Err(SparseTensorError::InvalidValuesShape {
-            expected: vec![k, n],
-            actual: dense_meta.shape().to_vec(),
+            expected: vec![sparse_shape[1], dense_shape[1]],
+            actual: dense_shape.to_vec(),
         });
     }
-    let output_len = m
-        .checked_mul(n)
-        .ok_or_else(|| DenseTensorError::ShapeOverflow { shape: vec![m, n] })?;
-    let output_meta = TensorMeta::from_shape(vec![m, n], dtype, Device::Cpu);
-    output_meta.validate().map_err(DenseTensorError::from)?;
-
+    let output_shape = [sparse_shape[0], dense_shape[1]];
+    let overflow = || DenseTensorError::ShapeOverflow {
+        shape: output_shape.to_vec(),
+    };
+    let output_len = output_shape[0]
+        .checked_mul(output_shape[1])
+        .ok_or_else(overflow)?;
+    if output_len
+        .checked_mul(dtype.element_size())
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(overflow().into());
+    }
+    // Storage access keeps the source dtype and metadata intact. In particular,
+    // F32 contributions are never widened through the F64 compatibility kernel.
     macro_rules! multiply {
-        ($variant:ident, $accessor:ident, $zero:expr, $update:expr) => {{
-            let values = sparse
-                .values()
+        ($accessor:ident, $constructor:ident, $zero:expr, $mul_add:expr) => {{
+            let sparse_values = values
                 .typed_storage()
                 .$accessor()
                 .ok_or(DenseTensorError::UnsupportedStorageAccess { dtype })?;
-            let rhs = dense
+            let dense_values = dense
                 .typed_storage()
                 .$accessor()
                 .ok_or(DenseTensorError::UnsupportedStorageAccess { dtype })?;
-            TensorStorage::$variant(std::sync::Arc::new(sparse_coo_matmul_values(
-                sparse,
-                dense_meta,
-                values,
-                rhs,
-                output_len,
+            let output = sparse_matmul_accumulate(
+                output_shape,
+                &indices,
+                (sparse_values, values.meta()),
+                (dense_values, dense.meta()),
                 $zero,
-                $update,
-            )?))
+                $mul_add,
+            );
+            DenseTensor::$constructor(output, output_shape.to_vec(), Device::Cpu)
+                .map_err(SparseTensorError::from)
         }};
     }
-
-    let storage = match dtype {
-        DType::F64 => multiply!(F64, as_f64, 0.0, |sum, a, b| sum + a * b),
-        DType::F32 => multiply!(F32, as_f32, 0.0, |sum, a, b| sum + a * b),
+    match dtype {
+        DType::F64 => multiply!(
+            as_f64,
+            from_contiguous_values,
+            0.0_f64,
+            |sum, a, b| sum + a * b
+        ),
+        DType::F32 => multiply!(
+            as_f32,
+            from_contiguous_values_f32,
+            0.0_f32,
+            |sum, a, b| sum + a * b
+        ),
+        // CPU sparse AXPY's Half/BFloat16 += overload converts the product to
+        // storage precision before adding it to the rounded destination.
         DType::F16 => multiply!(
-            F16,
             as_f16,
+            from_contiguous_values_f16,
             ft_core::Float16::ZERO,
             |sum, a, b| sum + a * b
         ),
         DType::BF16 => multiply!(
-            BF16,
             as_bf16,
+            from_contiguous_values_bf16,
             ft_core::BFloat16::ZERO,
             |sum, a, b| sum + a * b
         ),
         DType::Complex64 => multiply!(
-            Complex64,
             as_complex64,
+            from_contiguous_values_complex64,
             ft_core::Complex64::new(0.0, 0.0),
             |sum, a, b| sum + a * b
         ),
         DType::Complex128 => multiply!(
-            Complex128,
             as_complex128,
+            from_contiguous_values_complex128,
             Complex128::new(0.0, 0.0),
             |sum, a, b| sum + a * b
         ),
-        _ => return Err(DenseTensorError::UnsupportedDType(dtype).into()),
-    };
-    Ok(DenseTensor::from_typed_storage(output_meta, storage)?)
+        _ => Err(DenseTensorError::UnsupportedDType(dtype).into()),
+    }
 }
 
-fn sparse_coo_matmul_values<T: Copy>(
-    sparse: &SparseCOOTensor,
-    dense_meta: &TensorMeta,
-    values: &[T],
-    dense: &[T],
-    output_len: usize,
+fn sparse_matmul_accumulate<T: Copy>(
+    output_shape: [usize; 2],
+    indices: &SparseMatmulIndices<'_>,
+    values: (&[T], &TensorMeta),
+    dense: (&[T], &TensorMeta),
     zero: T,
-    update: impl Fn(T, T, T) -> T,
-) -> Result<Vec<T>, SparseTensorError> {
-    // In particular, [M, K] @ [K, 0] never evaluates offsets into empty
-    // storage, even when M*K could not fit in a dense allocation.
-    if output_len == 0 {
-        return Ok(Vec::new());
+    mul_add: impl Fn(T, T, T) -> T,
+) -> Vec<T> {
+    let [rows, columns] = output_shape;
+    let mut output = vec![zero; rows * columns];
+    if columns == 0 {
+        return output;
     }
-    let mut output = vec![zero; output_len];
-    let indices = sparse.indices().contiguous_values()?;
-    let nnz = sparse.nnz();
-    let n = dense_meta.shape()[1];
-    let value_meta = sparse.values().meta();
-    let value_offset = value_meta.storage_offset();
-    let value_stride = value_meta.strides()[0];
-    let dense_offset = dense_meta.storage_offset();
-    let row_stride = dense_meta.strides()[0];
-    let col_stride = dense_meta.strides()[1];
-
-    for entry in 0..nnz {
-        // Sparse constructors validate all coordinates; DenseTensor construction
-        // validates the complete storage span of every logical view.
-        let row = indices[entry] as usize;
-        let col = indices[nnz + entry] as usize;
-        let value = values[value_offset + entry * value_stride];
-        let rhs_start = dense_offset + col * row_stride;
-        let output_row = &mut output[row * n..(row + 1) * n];
-        if col_stride == 1 {
-            for (destination, &rhs) in output_row.iter_mut().zip(&dense[rhs_start..rhs_start + n])
-            {
-                *destination = update(*destination, value, rhs);
-            }
-        } else {
-            for (column, destination) in output_row.iter_mut().enumerate() {
-                *destination = update(*destination, value, dense[rhs_start + column * col_stride]);
-            }
+    let (values, values_meta) = values;
+    let (dense, dense_meta) = dense;
+    indices.for_each(|entry, row, inner| {
+        let value = values[values_meta.storage_offset() + entry * values_meta.strides()[0]];
+        let dense_row = dense_meta.storage_offset() + inner * dense_meta.strides()[0];
+        for column in 0..columns {
+            let rhs = dense[dense_row + column * dense_meta.strides()[1]];
+            let destination = &mut output[row * columns + column];
+            *destination = mul_add(*destination, value, rhs);
         }
-    }
-    Ok(output)
+    });
+    output
 }
 
 /// Coalesce a sparse COO tensor by summing duplicate indices.
@@ -78549,6 +78607,623 @@ mod tests {
         .unwrap()
         .to_dtype(dtype)
         .unwrap()
+    }
+
+    fn sparse_matmul_test_expected(
+        dtype: DType,
+        values: &[f64],
+        shape: Vec<usize>,
+    ) -> ft_core::DenseTensor {
+        if dtype.is_complex() {
+            ft_core::DenseTensor::from_contiguous_values_complex128(
+                values
+                    .iter()
+                    .map(|&value| Complex128::new(-3.0 * value, 4.0 * value))
+                    .collect(),
+                shape,
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+        } else {
+            sparse_test_typed_values(dtype, values, shape)
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_typed_coo_and_csr_match_independent_products() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            // Unsorted COO with duplicates represents rows [4,0,3], [0,0,-2],
+            // and [0,1,0]. CSR independently encodes the same matrix, retaining
+            // unsorted columns in its first row.
+            let coo = SparseCOOTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![2, 0, 2, 0, 1, 1, 2, 1, 0, 2],
+                    vec![2, 5],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                sparse_test_typed_values(dtype, &[2.0, 3.0, -1.0, 4.0, -2.0], vec![5]),
+                vec![3, 3],
+                false,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 2, 3, 4],
+                    vec![4],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![2, 0, 2, 1],
+                    vec![4],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                sparse_test_typed_values(dtype, &[3.0, 4.0, -2.0, 1.0], vec![4]),
+                [3, 3],
+            )
+            .unwrap();
+            let dense =
+                sparse_test_typed_values(dtype, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2]);
+            let expected = sparse_matmul_test_expected(
+                dtype,
+                &[19.0, 26.0, -10.0, -12.0, 3.0, 4.0],
+                vec![3, 2],
+            );
+            let original_coo = coo.clone();
+            let original_csr = csr.clone();
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+            ] {
+                assert_eq!(output.meta().shape(), &[3, 2]);
+                assert_eq!(output.meta().dtype(), dtype);
+                assert_eq!(output.meta().device(), Device::Cpu);
+                assert_eq!(output.typed_storage(), expected.typed_storage());
+            }
+            assert_eq!(coo, original_coo);
+            assert_eq!(csr, original_csr);
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_typed_views_preserve_offsets_strides_and_broadcasts() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            let backing = sparse_test_typed_values(dtype, &[99.0, 2.0, 99.0, 3.0], vec![4]);
+            let values = ft_core::DenseTensor::from_typed_storage(
+                TensorMeta::from_shape_and_strides(vec![2], vec![2], 1, dtype, Device::Cpu)
+                    .unwrap(),
+                backing.typed_storage().clone(),
+            )
+            .unwrap();
+            let coo = SparseCOOTensor::new(
+                ft_core::DenseI64Tensor::from_storage(
+                    TensorMeta::from_shape(vec![2, 2], DType::I64, Device::Cpu)
+                        .with_storage_offset(1),
+                    vec![99, 0, 1, 1, 0],
+                )
+                .unwrap(),
+                values.clone(),
+                vec![2, 2],
+                false,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                ft_core::DenseI64Tensor::from_storage(
+                    TensorMeta::from_shape(vec![3], DType::I64, Device::Cpu)
+                        .with_storage_offset(1),
+                    vec![99, 0, 1, 2],
+                )
+                .unwrap(),
+                ft_core::DenseI64Tensor::from_storage(
+                    TensorMeta::from_shape(vec![2], DType::I64, Device::Cpu)
+                        .with_storage_offset(1),
+                    vec![99, 1, 0],
+                )
+                .unwrap(),
+                values,
+                [2, 2],
+            )
+            .unwrap();
+            let dense_backing =
+                sparse_test_typed_values(dtype, &[99.0, 1.0, 4.0, 99.0, 2.0, 5.0], vec![6]);
+            let dense = ft_core::DenseTensor::from_typed_storage(
+                TensorMeta::from_shape_and_strides(
+                    vec![2, 2],
+                    vec![1, 3],
+                    1,
+                    dtype,
+                    Device::Cpu,
+                )
+                .unwrap(),
+                dense_backing.typed_storage().clone(),
+            )
+            .unwrap();
+            let expected = sparse_matmul_test_expected(dtype, &[8.0, 10.0, 3.0, 6.0], vec![2, 2]);
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+            ] {
+                assert_eq!(output.typed_storage(), expected.typed_storage());
+            }
+            let repeated_backing = sparse_test_typed_values(dtype, &[99.0, 2.0], vec![2]);
+            let repeated_dense = ft_core::DenseTensor::from_typed_storage(
+                TensorMeta::from_shape_and_strides(
+                    vec![2, 3],
+                    vec![0, 0],
+                    1,
+                    dtype,
+                    Device::Cpu,
+                )
+                .unwrap(),
+                repeated_backing.typed_storage().clone(),
+            )
+            .unwrap();
+            let expected =
+                sparse_matmul_test_expected(dtype, &[4.0, 4.0, 4.0, 6.0, 6.0, 6.0], vec![2, 3]);
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &repeated_dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &repeated_dense).unwrap(),
+            ] {
+                assert_eq!(output.typed_storage(), expected.typed_storage());
+            }
+            let repeated_values = ft_core::DenseTensor::from_typed_storage(
+                TensorMeta::from_shape_and_strides(vec![2], vec![0], 1, dtype, Device::Cpu)
+                    .unwrap(),
+                repeated_backing.typed_storage().clone(),
+            )
+            .unwrap();
+            let coo = SparseCOOTensor::new(
+                coo.indices().clone(),
+                repeated_values.clone(),
+                vec![2, 2],
+                false,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                csr.crow_indices().clone(),
+                csr.col_indices().clone(),
+                repeated_values,
+                [2, 2],
+            )
+            .unwrap();
+            let expected = sparse_matmul_test_expected(dtype, &[8.0, 10.0, 2.0, 4.0], vec![2, 2]);
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+            ] {
+                assert_eq!(output.typed_storage(), expected.typed_storage());
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_rounds_each_native_contribution() {
+        for (dtype, exponent) in [
+            (DType::F64, 53),
+            (DType::F32, 24),
+            (DType::F16, 11),
+            (DType::BF16, 8),
+            (DType::Complex64, 24),
+            (DType::Complex128, 53),
+        ] {
+            let large = 2.0_f64.powi(exponent);
+            let values = sparse_test_typed_values(dtype, &[large, 1.0, -large], vec![3]);
+            let coo = SparseCOOTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0; 6],
+                    vec![2, 3],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                values.clone(),
+                vec![1, 1],
+                false,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 3],
+                    vec![2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 1, 2],
+                    vec![3],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                values,
+                [1, 3],
+            )
+            .unwrap();
+            let coo_rhs = ft_core::DenseTensor::from_contiguous_values(
+                vec![1.0],
+                vec![1, 1],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let csr_rhs = ft_core::DenseTensor::from_contiguous_values(
+                vec![1.0; 3],
+                vec![3, 1],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let expected = sparse_test_typed_values(dtype, &[0.0], vec![1, 1]);
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &coo_rhs).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &csr_rhs).unwrap(),
+            ] {
+                // A wider accumulator would incorrectly retain the middle 1.
+                assert_eq!(output.typed_storage(), expected.typed_storage());
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_half_rounds_product_before_accumulator() {
+        for (dtype, fraction_bits) in [(DType::F16, 10), (DType::BF16, 7)] {
+            let step = 2.0_f64.powi(-fraction_bits);
+            let values = ft_core::DenseTensor::from_contiguous_values(
+                vec![-1.0, 1.0 + step],
+                vec![2],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let coo = SparseCOOTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 0, 0, 1],
+                    vec![2, 2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                values.clone(),
+                vec![1, 2],
+                true,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 2],
+                    vec![2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 1],
+                    vec![2],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                values,
+                [1, 2],
+            )
+            .unwrap();
+            let dense = ft_core::DenseTensor::from_contiguous_values(
+                vec![1.0, 1.0 - step],
+                vec![2, 1],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+            ] {
+                // The exact residual is -step^2, but CPU AXPY's half +=
+                // overload first rounds the product to 1, then adds -1.
+                // A single F32 multiply-add followed by narrowing gives a
+                // nonzero result and therefore violates this contract.
+                assert_eq!(output.meta().dtype(), dtype);
+                assert_eq!(output.contiguous_values_as_f64().unwrap(), [0.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_empty_shapes_and_zero_width_do_not_read_dense_values() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            for (sparse_shape, dense_shape) in [
+                ([3, 2], [2, 4]),
+                ([0, 2], [2, 3]),
+                ([3, 0], [0, 4]),
+                ([2, 2], [2, 0]),
+            ] {
+                let coo = SparseCOOTensor::from_coords(
+                    &[],
+                    vec![],
+                    sparse_shape.to_vec(),
+                    dtype,
+                    Device::Cpu,
+                )
+                .unwrap();
+                let csr = ft_core::SparseCSRTensor::new(
+                    ft_core::DenseI64Tensor::from_contiguous_values(
+                        vec![0; sparse_shape[0] + 1],
+                        vec![sparse_shape[0] + 1],
+                        Device::Cpu,
+                    )
+                    .unwrap(),
+                    ft_core::DenseI64Tensor::from_contiguous_values(
+                        vec![],
+                        vec![0],
+                        Device::Cpu,
+                    )
+                    .unwrap(),
+                    sparse_test_typed_values(dtype, &[], vec![0]),
+                    sparse_shape,
+                )
+                .unwrap();
+                let dense = ft_core::DenseTensor::from_contiguous_values(
+                    vec![f64::NAN; dense_shape[0] * dense_shape[1]],
+                    dense_shape.to_vec(),
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let output_shape = vec![sparse_shape[0], dense_shape[1]];
+                let expected = sparse_test_typed_values(
+                    dtype,
+                    &vec![0.0; sparse_shape[0] * dense_shape[1]],
+                    output_shape.clone(),
+                );
+                for output in [
+                    super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                    super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+                ] {
+                    assert_eq!(output.meta().shape(), output_shape);
+                    assert_eq!(output.meta().dtype(), dtype);
+                    assert_eq!(output.typed_storage(), expected.typed_storage());
+                }
+            }
+            // Zero-width output also avoids reading a stored NaN value.
+            let coo = SparseCOOTensor::from_coords(
+                &[vec![0, 1]],
+                vec![f64::NAN],
+                vec![2, 2],
+                dtype,
+                Device::Cpu,
+            )
+            .unwrap();
+            let dense = sparse_test_typed_values(dtype, &[], vec![2, 0]);
+            let output = super::sparse_coo_matmul_dense(&coo, &dense).unwrap();
+            assert_eq!(output.meta().shape(), &[2, 0]);
+            assert_eq!(output.meta().dtype(), dtype);
+            assert!(output.typed_storage().is_empty());
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_distinguishes_stored_zero_from_absent_entries() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            let coo = SparseCOOTensor::from_coords(
+                &[vec![0, 0]],
+                vec![0.0],
+                vec![2, 1],
+                dtype,
+                Device::Cpu,
+            )
+            .unwrap();
+            let csr = ft_core::SparseCSRTensor::new(
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0, 1, 1],
+                    vec![3],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                ft_core::DenseI64Tensor::from_contiguous_values(
+                    vec![0],
+                    vec![1],
+                    Device::Cpu,
+                )
+                .unwrap(),
+                coo.values().clone(),
+                [2, 1],
+            )
+            .unwrap();
+            let dense = ft_core::DenseTensor::from_contiguous_values(
+                vec![f64::INFINITY],
+                vec![1, 1],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            for output in [
+                super::sparse_coo_matmul_dense(&coo, &dense).unwrap(),
+                super::sparse_csr_matmul_dense(&csr, &dense).unwrap(),
+            ] {
+                let values = output.contiguous_values_as_f64().unwrap();
+                assert!(values[0].is_nan(), "a stored zero still multiplies infinity");
+                assert_eq!(values[1], 0.0, "an absent entry performs no multiplication");
+                if dtype.is_complex() {
+                    let output = output.to_dtype(DType::Complex128).unwrap();
+                    let values = output.contiguous_values_complex128().unwrap();
+                    assert!(values[0].im.is_nan());
+                    assert_eq!(values[1], Complex128::new(0.0, 0.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_matmul_rejects_incompatible_operands_before_allocation() {
+        let coo = SparseCOOTensor::from_coords(
+            &[vec![0, 0]],
+            vec![1.0],
+            vec![1, 1],
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+        let csr = ft_core::SparseCSRTensor::new(
+            ft_core::DenseI64Tensor::from_contiguous_values(
+                vec![0, 1],
+                vec![2],
+                Device::Cpu,
+            )
+            .unwrap(),
+            ft_core::DenseI64Tensor::from_contiguous_values(
+                vec![0],
+                vec![1],
+                Device::Cpu,
+            )
+            .unwrap(),
+            coo.values().clone(),
+            [1, 1],
+        )
+        .unwrap();
+        let dense = ft_core::DenseTensor::from_contiguous_values(
+            vec![1.0],
+            vec![1, 1],
+            Device::Cpu,
+        )
+        .unwrap();
+        let wrong_dtype = dense.to_dtype(DType::F32).unwrap();
+        for result in [
+            super::sparse_coo_matmul_dense(&coo, &wrong_dtype),
+            super::sparse_csr_matmul_dense(&csr, &wrong_dtype),
+        ] {
+            assert!(matches!(result, Err(ft_core::SparseTensorError::DTypeMismatch { .. })));
+        }
+        for invalid in [
+            ft_core::DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu)
+                .unwrap(),
+            ft_core::DenseTensor::from_contiguous_values(vec![1.0; 2], vec![2, 1], Device::Cpu)
+                .unwrap(),
+            ft_core::DenseTensor::from_contiguous_values(vec![1.0], vec![1, 1], Device::Cuda)
+                .unwrap(),
+        ] {
+            assert!(super::sparse_coo_matmul_dense(&coo, &invalid).is_err());
+            assert!(super::sparse_csr_matmul_dense(&csr, &invalid).is_err());
+        }
+        let accelerator_coo = SparseCOOTensor::from_coords(
+            &[vec![0, 0]],
+            vec![1.0],
+            vec![1, 1],
+            DType::F64,
+            Device::Cuda,
+        )
+        .unwrap();
+        let accelerator_dense = ft_core::DenseTensor::from_contiguous_values(
+            vec![1.0],
+            vec![1, 1],
+            Device::Cuda,
+        )
+        .unwrap();
+        assert!(matches!(
+            super::sparse_coo_matmul_dense(&accelerator_coo, &accelerator_dense),
+            Err(ft_core::SparseTensorError::DeviceMismatch { expected: Device::Cpu, .. })
+        ));
+        let hybrid = SparseCOOTensor::new(
+            ft_core::DenseI64Tensor::from_contiguous_values(
+                vec![0],
+                vec![1, 1],
+                Device::Cpu,
+            )
+            .unwrap(),
+            ft_core::DenseTensor::from_contiguous_values(
+                vec![1.0, 2.0],
+                vec![1, 2],
+                Device::Cpu,
+            )
+            .unwrap(),
+            vec![2, 2],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            super::sparse_coo_matmul_dense(&hybrid, &dense),
+            Err(ft_core::SparseTensorError::SparseDimMismatch { .. })
+        ));
+        let quantized_values = ft_core::DenseTensor::from_contiguous_values_qint8(
+            vec![1],
+            vec![1],
+            Device::Cpu,
+            1.0,
+            0,
+        )
+        .unwrap();
+        let quantized = SparseCOOTensor::new(
+            coo.indices().clone(),
+            quantized_values,
+            vec![1, 1],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            super::sparse_coo_matmul_dense(&quantized, &dense),
+            Err(ft_core::SparseTensorError::DenseTensor(
+                ft_core::DenseTensorError::UnsupportedDType(DType::QInt8)
+            ))
+        ));
+        // Empty sparse storage can describe enormous shapes without allocating
+        // the represented matrix. Validate element and byte capacity first.
+        for (rows, columns) in [
+            (usize::MAX / 2 + 1, 3),
+            (isize::MAX as usize / DType::F64.element_size() + 1, 1),
+        ] {
+            let huge = SparseCOOTensor::from_coords(
+                &[],
+                vec![],
+                vec![rows, 1],
+                DType::F64,
+                Device::Cpu,
+            )
+            .unwrap();
+            let rhs = ft_core::DenseTensor::from_contiguous_values(
+                vec![1.0; columns],
+                vec![1, columns],
+                Device::Cpu,
+            )
+            .unwrap();
+            assert!(matches!(
+                super::sparse_coo_matmul_dense(&huge, &rhs),
+                Err(ft_core::SparseTensorError::DenseTensor(
+                    ft_core::DenseTensorError::ShapeOverflow { .. }
+                ))
+            ));
+        }
     }
 
     #[test]
