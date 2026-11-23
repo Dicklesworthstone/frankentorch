@@ -90134,34 +90134,8 @@ impl FrankenTorchSession {
         &self,
         input: TensorNodeId,
     ) -> Result<SparseCOOTensor, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
-        let shape = tensor.meta().shape().to_vec();
-        let values = tensor.contiguous_values_as_f64()?;
-
-        let strides = ft_core::contiguous_strides(&shape);
-        let mut coords = Vec::new();
-        let mut sparse_values = Vec::new();
-
-        for (linear_idx, &val) in values.iter().enumerate() {
-            if val != 0.0 {
-                // Convert linear index to multi-index
-                let mut coord = Vec::with_capacity(shape.len());
-                let mut remaining = linear_idx;
-                for &stride in &strides {
-                    coord.push((remaining / stride) as i64);
-                    remaining %= stride;
-                }
-                coords.push(coord);
-                sparse_values.push(val);
-            }
-        }
-
-        Ok(SparseCOOTensor::from_coords(
-            &coords,
-            sparse_values,
-            shape,
-            tensor.meta().dtype(),
-            tensor.meta().device(),
+        Ok(SparseCOOTensor::from_dense(
+            self.tensor_tape.tensor(input)?,
         )?)
     }
 
@@ -104128,6 +104102,88 @@ mod tests {
         TensorNodeId, bessel_i1_derivative_scalar, bessel_i1e_derivative_scalar,
         stable_softplus_f32,
     };
+
+    #[test]
+    fn public_sparse_coo_conversion_preserves_complex_strided_views() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::Complex64, DType::Complex128] {
+                let mut session = FrankenTorchSession::new(mode);
+                let backing = DenseTensor::from_contiguous_values_complex128(
+                    vec![
+                        Complex128::new(99.0, 99.0),
+                        Complex128::new(0.0, 2.0),
+                        Complex128::new(0.0, 0.0),
+                        Complex128::new(99.0, 99.0),
+                        Complex128::new(3.0, -4.0),
+                        Complex128::new(5.0, 0.0),
+                    ],
+                    vec![6],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                let meta = TensorMeta::from_shape_and_strides(
+                    vec![2, 2],
+                    vec![1, 3],
+                    1,
+                    dtype,
+                    Device::Cpu,
+                )
+                .unwrap();
+                let view =
+                    DenseTensor::from_typed_storage(meta, backing.typed_storage().clone()).unwrap();
+                let input = session.tensor_variable_from_storage(view, true);
+                let before = session.autograd_graph_node_count();
+                let sparse = session.tensor_to_sparse_coo(input).unwrap();
+                assert_eq!(session.autograd_graph_node_count(), before);
+                assert!(session.tensor_requires_grad(input).unwrap());
+                assert!(sparse.is_coalesced());
+                assert_eq!(sparse.dtype(), dtype);
+                assert_eq!(sparse.dense_shape(), &[2, 2]);
+                assert_eq!(
+                    sparse.indices().contiguous_values().unwrap(),
+                    &[0, 0, 1, 0, 1, 1]
+                );
+                let expected = DenseTensor::from_contiguous_values_complex128(
+                    vec![
+                        Complex128::new(0.0, 2.0),
+                        Complex128::new(3.0, -4.0),
+                        Complex128::new(5.0, 0.0),
+                    ],
+                    vec![3],
+                    Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+                assert_eq!(sparse.values().typed_storage(), expected.typed_storage());
+                let alias = session.to_sparse_coo_tensor(input).unwrap();
+                assert_eq!(alias.values().typed_storage(), expected.typed_storage());
+            }
+        }
+    }
+
+    #[test]
+    fn public_sparse_coo_conversion_rejects_quantized_and_invalid_inputs() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let quantized =
+                DenseTensor::from_contiguous_values_qint8(vec![0, 2], vec![2], Device::Cpu, 0.5, 0)
+                    .unwrap();
+            let input = session.tensor_variable_from_storage(quantized, false);
+            session.set_grad_enabled(false);
+            let before = session.autograd_graph_node_count();
+            assert!(session.tensor_to_sparse_coo(input).is_err());
+            assert!(
+                session
+                    .tensor_to_sparse_coo(TensorNodeId(usize::MAX))
+                    .is_err()
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+            assert!(!session.is_grad_enabled());
+        }
+    }
 
     #[test]
     fn session_add_backward_records_evidence() {
