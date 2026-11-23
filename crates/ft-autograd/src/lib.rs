@@ -4711,6 +4711,43 @@ impl TensorTape {
         id
     }
 
+    /// Read the tensor's logical elements into compact, offset-zero storage.
+    ///
+    /// Already compact storage is shared without copying. Other layouts use
+    /// the core typed materialization path, preserving both complex lanes, half-precision
+    /// bit patterns, quantization parameters, and the original device. This is
+    /// a value read only: it does not add or detach any autograd node.
+    pub fn compact_tensor(&self, input: TensorNodeId) -> Result<DenseTensor, AutogradError> {
+        Ok(self.node(input)?.tensor.to_contiguous()?)
+    }
+
+    /// Return an already-contiguous tensor unchanged, otherwise materialize
+    /// logical values and retain the identity adjoint at every supported order.
+    pub fn contiguous(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let source = self.node(input)?;
+        let meta = source.tensor.meta();
+        if meta.is_contiguous() {
+            return Ok(input);
+        }
+        let original_shape = meta.shape().to_vec();
+        let requires_grad = source.requires_grad && self.grad_enabled;
+        let tensor = self.compact_tensor(input)?;
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor,
+            requires_grad,
+            op: if requires_grad {
+                TensorNodeOp::View {
+                    input,
+                    original_shape,
+                }
+            } else {
+                TensorNodeOp::Leaf
+            },
+        });
+        Ok(out)
+    }
+
     pub fn values(&self, node: TensorNodeId) -> Result<Vec<f64>, AutogradError> {
         Ok(self.node(node)?.tensor.contiguous_values()?.to_vec())
     }
@@ -4925,21 +4962,24 @@ impl TensorTape {
         }
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
+        let compact = if meta.is_contiguous() {
+            None
+        } else {
+            Some(self.compact_tensor(input)?)
+        };
+        let tensor = compact.as_ref().unwrap_or(&input_node.tensor);
         let f32_values: Vec<f32> = match input_dtype {
-            DType::F16 => input_node
-                .tensor
+            DType::F16 => tensor
                 .contiguous_values_f16()?
                 .iter()
                 .map(|v| v.to_f32())
                 .collect(),
-            DType::BF16 => input_node
-                .tensor
+            DType::BF16 => tensor
                 .contiguous_values_bf16()?
                 .iter()
                 .map(|v| v.to_f32())
                 .collect(),
-            _ => input_node
-                .tensor
+            _ => tensor
                 .contiguous_values()?
                 .iter()
                 .map(|&v| v as f32)
@@ -4972,7 +5012,11 @@ impl TensorTape {
         }
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
-        let f64_values = input_node.tensor.contiguous_values_as_f64()?;
+        let f64_values = if meta.is_contiguous() {
+            input_node.tensor.contiguous_values_as_f64()?
+        } else {
+            self.compact_tensor(input)?.contiguous_values_as_f64()?
+        };
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
@@ -5012,7 +5056,11 @@ impl TensorTape {
                 ft_core::DenseTensorError::UnsupportedDType(input_dtype),
             ));
         }
-        let f64_values = input_node.tensor.contiguous_values_as_f64()?;
+        let f64_values = if input_node.tensor.meta().is_contiguous() {
+            input_node.tensor.contiguous_values_as_f64()?
+        } else {
+            self.compact_tensor(input)?.contiguous_values_as_f64()?
+        };
         let requires_grad = input_node.requires_grad && self.grad_enabled;
         let meta = input_node.tensor.meta().clone();
         let out_meta = TensorMeta::from_shape(meta.shape().to_vec(), target, meta.device());
@@ -9682,6 +9730,10 @@ impl TensorTape {
                 let vals: std::borrow::Cow<'_, [f64]> =
                     if output_dtype == DType::F64 && meta.is_contiguous() {
                         std::borrow::Cow::Borrowed(node.tensor.contiguous_values()?)
+                    } else if !meta.is_contiguous() {
+                        std::borrow::Cow::Owned(
+                            self.compact_tensor(input_id)?.contiguous_values_as_f64()?,
+                        )
                     } else {
                         std::borrow::Cow::Owned(node.tensor.contiguous_values_as_f64()?)
                     };
@@ -9913,6 +9965,10 @@ impl TensorTape {
                 let vals: std::borrow::Cow<'_, [f64]> =
                     if output_dtype == DType::F64 && meta.is_contiguous() {
                         std::borrow::Cow::Borrowed(node.tensor.contiguous_values()?)
+                    } else if !meta.is_contiguous() {
+                        std::borrow::Cow::Owned(
+                            self.compact_tensor(input_id)?.contiguous_values_as_f64()?,
+                        )
                     } else {
                         std::borrow::Cow::Owned(node.tensor.contiguous_values_as_f64()?)
                     };

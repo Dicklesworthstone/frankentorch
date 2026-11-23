@@ -3760,6 +3760,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_strided_views_are_contiguous_without_reading_storage() {
+        let meta = TensorMeta::from_shape_and_strides(
+            vec![2, 0, 3],
+            vec![23, 777, 5],
+            2,
+            DType::F64,
+            Device::Cpu,
+        )
+        .expect("empty strided metadata should validate");
+        assert!(meta.is_contiguous());
+        let tensor = DenseTensor::from_storage(meta.clone(), vec![5.0, 6.0])
+            .expect("empty view needs storage only up to its offset");
+        assert!(tensor.contiguous_values().unwrap().is_empty());
+        assert!(tensor.contiguous_values_as_f64().unwrap().is_empty());
+
+        let complex_meta = TensorMeta::from_shape_and_strides(
+            meta.shape().to_vec(),
+            meta.strides().to_vec(),
+            meta.storage_offset(),
+            DType::Complex128,
+            Device::Cpu,
+        )
+        .unwrap();
+        let complex = DenseTensor::from_storage_complex128(
+            complex_meta,
+            vec![Complex128::new(1.0, 2.0), Complex128::new(3.0, 4.0)],
+        )
+        .unwrap();
+        assert!(complex.contiguous_values_complex128().unwrap().is_empty());
+
+        assert!(matches!(
+            DenseTensor::from_storage(meta.clone(), vec![5.0]),
+            Err(DenseTensorError::InsufficientStorage {
+                needed: 2,
+                actual: 1,
+            })
+        ));
+        let mut malformed = meta;
+        malformed.strides.pop();
+        assert!(
+            !malformed.is_contiguous(),
+            "empty shapes must still reject stride-rank mismatches"
+        );
+    }
+
+    #[test]
     fn custom_strides_validate_and_index_into_storage() {
         let meta =
             TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 3, DType::F64, Device::Cpu)

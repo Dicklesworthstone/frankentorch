@@ -2319,8 +2319,7 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `tensor.cfloat()` in PyTorch. A real input becomes a
     /// complex tensor with a zero imaginary part; a complex input is re-cast to
-    /// single precision. As elsewhere in this port, complex-valued autograd is
-    /// unsupported, so a `requires_grad` input fails loud (matching `fft`/`polar`).
+    /// single precision. Gradients flow through the real/imaginary components.
     pub fn tensor_cfloat(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.cast_real_to_complex(input, DType::F32, DType::Complex64)
     }
@@ -2329,8 +2328,7 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `tensor.cdouble()` in PyTorch. A real input becomes a
     /// complex tensor with a zero imaginary part; a complex input is re-cast to
-    /// double precision. Complex-valued autograd is unsupported, so a
-    /// `requires_grad` input fails loud (matching `fft`/`polar`).
+    /// double precision. Gradients flow through the real/imaginary components.
     pub fn tensor_cdouble(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.cast_real_to_complex(input, DType::F64, DType::Complex128)
     }
@@ -2338,9 +2336,8 @@ impl FrankenTorchSession {
     /// Cast `input` to a complex dtype: real input -> (input, 0i) at
     /// `real_dtype` precision; complex input -> re-cast both components to
     /// `real_dtype`. `complex_dtype` is the matching complex target
-    /// (F32 -> Complex64, F64 -> Complex128). Composes through the existing
-    /// (non-differentiable) `tensor_complex`, so it inherits its requires_grad
-    /// guard. Backs `tensor_cfloat`/`tensor_cdouble`.
+    /// (F32 -> Complex64, F64 -> Complex128). Composes through the differentiable
+    /// `tensor_complex` bridge. Backs `tensor_cfloat`/`tensor_cdouble`.
     fn cast_real_to_complex(
         &mut self,
         input: TensorNodeId,
@@ -2361,10 +2358,8 @@ impl FrankenTorchSession {
         }
         // Real input: real = input at target precision, imaginary = zeros.
         let re = self.tensor_to_dtype(input, real_dtype)?;
-        let shape = self.tensor_shape(re)?;
-        let zeros = self.tensor_zeros(shape, false)?;
-        let zeros_c = self.tensor_to_dtype(zeros, real_dtype)?;
-        self.tensor_complex(re, zeros_c)
+        let zeros = self.full_like(re, 0.0, false)?;
+        self.tensor_complex(re, zeros)
     }
 
     /// Cast a tensor to the given dtype.
@@ -2394,9 +2389,12 @@ impl FrankenTorchSession {
         self.tensor_to_dtype(input, target_dtype)
     }
 
-    /// Return the real component of a complex tensor.
+    /// Return the real component of a complex tensor, or a real input unchanged.
     pub fn tensor_real(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
+        if self.tensor_dtype(input)?.is_floating_point() {
+            return Ok(input);
+        }
+        let tensor = self.tensor_tape.compact_tensor(input)?;
         let meta = tensor.meta().clone();
         let requires_grad =
             self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
@@ -2443,7 +2441,7 @@ impl FrankenTorchSession {
 
     /// Return the imaginary component of a complex tensor.
     pub fn tensor_imag(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
+        let tensor = self.tensor_tape.compact_tensor(input)?;
         let meta = tensor.meta().clone();
         let requires_grad =
             self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
@@ -2489,7 +2487,7 @@ impl FrankenTorchSession {
 
     /// Return the element-wise complex conjugate of a complex tensor.
     pub fn tensor_conj(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
+        let tensor = self.tensor_tape.compact_tensor(input)?;
         let meta = tensor.meta().clone();
         let requires_grad =
             self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
@@ -2561,10 +2559,8 @@ impl FrankenTorchSession {
         real: TensorNodeId,
         imag: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let real_tensor = self.tensor_tape.tensor(real)?;
-        let imag_tensor = self.tensor_tape.tensor(imag)?;
-        let real_meta = real_tensor.meta().clone();
-        let imag_meta = imag_tensor.meta().clone();
+        let real_meta = self.tensor_tape.tensor_meta(real)?.clone();
+        let imag_meta = self.tensor_tape.tensor_meta(imag)?.clone();
 
         let requires_grad = self.tensor_tape.is_grad_enabled()
             && (self.tensor_tape.tensor_requires_grad(real)?
@@ -2576,6 +2572,14 @@ impl FrankenTorchSession {
                 },
             )));
         }
+
+        if real_meta.device() != imag_meta.device() {
+            return Err(Self::incompatible_tensor_args(
+                "complex: real and imag must be on the same device",
+            ));
+        }
+        let real_tensor = self.tensor_tape.compact_tensor(real)?;
+        let imag_tensor = self.tensor_tape.compact_tensor(imag)?;
 
         let (output_meta, output_storage) =
             match (real_tensor.typed_storage(), imag_tensor.typed_storage()) {
@@ -2755,7 +2759,7 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
+        let tensor = self.tensor_tape.compact_tensor(input)?;
         let meta = tensor.meta().clone();
         let requires_grad =
             self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
@@ -2803,8 +2807,7 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let tensor = self.tensor_tape.tensor(input)?;
-        let meta = tensor.meta().clone();
+        let meta = self.tensor_tape.tensor_meta(input)?.clone();
         let requires_grad =
             self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
 
@@ -2831,6 +2834,18 @@ impl FrankenTorchSession {
                 },
             )));
         }
+
+        if meta.strides().last() != Some(&1)
+            || !meta.storage_offset().is_multiple_of(2)
+            || meta.strides()[..meta.strides().len() - 1]
+                .iter()
+                .any(|stride| !stride.is_multiple_of(2))
+        {
+            return Err(Self::incompatible_tensor_args(
+                "view_as_complex: the last stride must be 1 and all other strides and the storage offset must be even",
+            ));
+        }
+        let tensor = self.tensor_tape.compact_tensor(input)?;
 
         let output_shape = leading_dims.to_vec();
         let (output_meta, output_storage) = match tensor.typed_storage() {
@@ -43772,9 +43787,9 @@ impl FrankenTorchSession {
         self.tensor_clone(input, requires_grad)
     }
 
-    /// Return contiguous tensor (no-op in FrankenTorch). Alias for tensor_contiguous.
+    /// Return a contiguous tensor. Alias for tensor_contiguous.
     pub fn functional_contiguous(
-        &self,
+        &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_contiguous(input)
@@ -60844,8 +60859,9 @@ impl FrankenTorchSession {
         }
     }
 
-    pub fn tensor_is_contiguous(&self, _node: TensorNodeId) -> Result<bool, AutogradError> {
-        Ok(true)
+    pub fn tensor_is_contiguous(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        let meta = self.tensor_tape.tensor_meta(node)?;
+        Ok(meta.is_contiguous())
     }
 
     /// Returns whether the tensor is a conjugated view.
@@ -60878,8 +60894,10 @@ impl FrankenTorchSession {
         Ok(false)
     }
 
-    pub fn tensor_contiguous(&self, node: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        Ok(node)
+    /// Preserve contiguous inputs, including offset views, and materialize
+    /// strided inputs with their dtype, device and gradient history intact.
+    pub fn tensor_contiguous(&mut self, node: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_tape.contiguous(node)
     }
 
     /// Create a copy of a tensor detached from the computation graph.
@@ -85673,26 +85691,7 @@ impl FrankenTorchSession {
             {
                 None
             } else {
-                let storage =
-                    match dtype {
-                        DType::F32 => TensorStorage::F32(Arc::new(vec![0.0; meta.numel()])),
-                        DType::F64 => TensorStorage::F64(Arc::new(vec![0.0; meta.numel()])),
-                        DType::Complex64 => TensorStorage::Complex64(Arc::new(vec![
-                        ft_core::Complex64::new(0.0, 0.0);
-                        meta.numel()
-                    ])),
-                        DType::Complex128 => TensorStorage::Complex128(Arc::new(vec![
-                        Complex128::new(0.0, 0.0);
-                        meta.numel()
-                    ])),
-                        _ => unreachable!("irfft2 dtype was validated above"),
-                    };
-                let mut compact = DenseTensor::from_typed_storage(
-                    TensorMeta::from_shape(shape.clone(), dtype, meta.device()),
-                    storage,
-                )?;
-                compact.copy_values_from(source)?;
-                Some(compact)
+                Some(self.tensor_tape.compact_tensor(input)?)
             }
         };
         let input = match compact {
@@ -92740,9 +92739,9 @@ impl FrankenTorchSession {
         Ok(shape.len() == 2 && shape[0] == shape[1])
     }
 
-    /// Check if tensor is contiguous (always true for dense).
-    pub fn is_contiguous(&self, _input: TensorNodeId) -> bool {
-        true
+    /// Check the actual layout; invalid tensor handles return false.
+    pub fn is_contiguous(&self, input: TensorNodeId) -> bool {
+        self.tensor_is_contiguous(input).unwrap_or(false)
     }
 
     // ── Tensor Creation Shortcuts ────────────────────────────────────────
@@ -99214,7 +99213,7 @@ impl FrankenTorchSession {
     }
 
     /// Make tensor contiguous in memory.
-    pub fn contiguous_tensor(&self, node: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+    pub fn contiguous_tensor(&mut self, node: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.tensor_contiguous(node)
     }
 
