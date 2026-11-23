@@ -96,6 +96,153 @@ const PARAM_UPDATE_FLOAT_REASON: &str =
     "parameter update only supported for float32/float64 tensors";
 const NAN_TO_NUM_FLOAT_REASON: &str = "nan_to_num only supported for float32/float64 tensors";
 
+/// Sparse multiplication and its two bilinear adjoints are closed under
+/// differentiation. No contraction materializes the sparse matrix or an
+/// [nnz, output_columns] gather buffer, including in higher-order backward.
+#[derive(Clone, Copy)]
+enum SparseMatmulContraction {
+    Product,
+    ValuesGradient,
+    DenseGradient,
+}
+
+struct SparseMatmulPlan {
+    coordinates: Vec<[usize; 2]>,
+    rows: usize,
+    inner: usize,
+    columns: usize,
+}
+
+impl SparseMatmulPlan {
+    fn output_shape(&self, contraction: SparseMatmulContraction) -> Vec<usize> {
+        match contraction {
+            SparseMatmulContraction::Product => vec![self.rows, self.columns],
+            SparseMatmulContraction::ValuesGradient => vec![self.coordinates.len()],
+            SparseMatmulContraction::DenseGradient => vec![self.inner, self.columns],
+        }
+    }
+
+    // Shape, coordinate and allocation bounds are checked before recording.
+    // The tape stores cotangents in F64 independently of the forward dtype.
+    fn evaluate(
+        &self,
+        contraction: SparseMatmulContraction,
+        lhs: &[f64],
+        rhs: &[f64],
+    ) -> Vec<f64> {
+        let mut output = vec![0.0; self.output_shape(contraction).iter().product()];
+        for (entry, &[row, column]) in self.coordinates.iter().enumerate() {
+            for feature in 0..self.columns {
+                let row_offset = row * self.columns + feature;
+                let column_offset = column * self.columns + feature;
+                match contraction {
+                    SparseMatmulContraction::Product => {
+                        output[row_offset] += lhs[entry] * rhs[column_offset];
+                    }
+                    SparseMatmulContraction::ValuesGradient => {
+                        output[entry] += lhs[row_offset] * rhs[column_offset];
+                    }
+                    SparseMatmulContraction::DenseGradient => {
+                        output[column_offset] += lhs[entry] * rhs[row_offset];
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    /// Each input's adjoint is another sparse contraction. Operand 0 is the
+    /// incoming cotangent; operands 1 and 2 are the original inputs.
+    fn adjoints(
+        contraction: SparseMatmulContraction,
+    ) -> [(SparseMatmulContraction, usize, usize); 2] {
+        use SparseMatmulContraction::{DenseGradient, Product, ValuesGradient};
+        match contraction {
+            Product => [(ValuesGradient, 0, 2), (DenseGradient, 1, 0)],
+            ValuesGradient => [(Product, 0, 2), (DenseGradient, 0, 1)],
+            DenseGradient => [(ValuesGradient, 2, 0), (Product, 1, 0)],
+        }
+    }
+
+    fn record(
+        self: &Arc<Self>,
+        tape: &mut TensorTape,
+        contraction: SparseMatmulContraction,
+        inputs: [TensorNodeId; 2],
+        native_output: Option<Vec<f64>>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let forward_plan = Arc::clone(self);
+        let backward_plan = Arc::clone(self);
+        let graph_plan = Arc::clone(self);
+        let needs = [
+            tape.tensor_requires_grad(inputs[0])? && tape.is_grad_enabled(),
+            tape.tensor_requires_grad(inputs[1])? && tape.is_grad_enabled(),
+        ];
+        let output = tape.apply_function_with_create_graph(
+            &inputs,
+            move |ctx, tensors| {
+                // A bilinear derivative needs only the OTHER operand. Retain
+                // stable slots without copying operands no adjoint reads.
+                for slot in 0..2 {
+                    let (values, shape) = tensors[slot];
+                    ctx.save_for_backward(
+                        if ctx.needs_input_grad()[1 - slot] {
+                            values.to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        shape.to_vec(),
+                    );
+                }
+                let values = native_output.unwrap_or_else(|| {
+                    forward_plan.evaluate(contraction, tensors[0].0, tensors[1].0)
+                });
+                Ok((values, forward_plan.output_shape(contraction)))
+            },
+            move |ctx, gradients| {
+                let operands = [
+                    gradients[0],
+                    ctx.saved_tensors()[0].as_slice(),
+                    ctx.saved_tensors()[1].as_slice(),
+                ];
+                Ok(Self::adjoints(contraction)
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(adjoint, lhs, rhs))| {
+                        ctx.needs_input_grad()[slot].then(|| {
+                            backward_plan.evaluate(adjoint, operands[lhs], operands[rhs])
+                        })
+                    })
+                    .collect())
+            },
+            move |ctx, gradients, inputs, tape| {
+                let operands = [gradients[0], inputs[0], inputs[1]];
+                let mut result = vec![None, None];
+                for (slot, (adjoint, lhs, rhs)) in
+                    Self::adjoints(contraction).into_iter().enumerate()
+                {
+                    if ctx.needs_input_grad()[slot] {
+                        let lhs = tape.to_dtype(operands[lhs], DType::F64)?;
+                        let rhs = tape.to_dtype(operands[rhs], DType::F64)?;
+                        result[slot] =
+                            Some(graph_plan.record(tape, adjoint, [lhs, rhs], None)?);
+                    }
+                }
+                Ok(result)
+            },
+        )?;
+        if needs.iter().any(|&needed| needed) {
+            let saved = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &input)| needs[1 - slot].then_some(input))
+                .collect::<Vec<_>>();
+            tape.save_custom_function_input_versions(output, &saved)?;
+        }
+        Ok(output)
+    }
+}
+
 /// Element count at or above which widening an f32 gradient to the tape's f64 storage
 /// is worth a rayon fork/join — `frankentorch-68pwz`.
 ///
@@ -90155,6 +90302,244 @@ impl FrankenTorchSession {
         sparse: &SparseCSRTensor,
     ) -> Result<DenseTensor, SparseTensorError> {
         sparse.to_dense()
+    }
+
+    /// Multiply a COO matrix by a dense matrix, preserving gradients to its
+    /// stored values and the dense operand. Indices have shape [2, nnz],
+    /// values have shape [nnz], and shape is the matrix's [rows, inner] shape.
+    /// Duplicate coordinates contribute additively; each stored value receives
+    /// its own gradient. Coordinates themselves are not differentiable.
+    ///
+    /// CPU F32/F64/F16/BF16 and complex dtypes are supported. Real contractions
+    /// support higher derivatives; complex backward follows the tape's
+    /// first-order conjugate-gradient convention. The sparse matrix is never
+    /// densified. Invalid metadata is rejected before recording nodes.
+    pub fn tensor_sparse_coo_mm(
+        &mut self,
+        indices: &DenseI64Tensor,
+        values: TensorNodeId,
+        shape: [usize; 2],
+        dense: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let sparse = SparseCOOTensor::new(
+            indices.clone(),
+            self.tensor_tape.tensor(values)?.clone(),
+            shape.to_vec(),
+            false,
+        )?;
+        self.validate_sparse_matmul_grad_buffers(values, dense, shape)?;
+        let output = ft_kernel_cpu::sparse_coo_matmul_dense(
+            &sparse,
+            self.tensor_tape.tensor(dense)?,
+        )?;
+        let index_values = sparse.indices().contiguous_values()?;
+        let nnz = sparse.nnz();
+        let coordinates = (0..nnz)
+            .map(|entry| {
+                [
+                    index_values[entry] as usize,
+                    index_values[nnz + entry] as usize,
+                ]
+            })
+            .collect();
+        let out = self.record_sparse_matmul(values, dense, shape, coordinates, output)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "sparse_coo_mm values={} dense={} out={}",
+                values.0, dense.0, out.0
+            ),
+        );
+        Ok(out)
+    }
+
+    /// Multiply a CSR matrix by a dense matrix with differentiable stored
+    /// values and dense input. Row pointers, columns and values follow
+    /// SparseCSRTensor: columns may be unsorted within a row, but duplicate
+    /// columns are rejected by that type's invariant checks.
+    ///
+    /// Dtype, layout, device and gradient behavior match tensor_sparse_coo_mm.
+    pub fn tensor_sparse_csr_mm(
+        &mut self,
+        crow_indices: &DenseI64Tensor,
+        col_indices: &DenseI64Tensor,
+        values: TensorNodeId,
+        shape: [usize; 2],
+        dense: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let sparse = SparseCSRTensor::new(
+            crow_indices.clone(),
+            col_indices.clone(),
+            self.tensor_tape.tensor(values)?.clone(),
+            shape,
+        )?;
+        self.validate_sparse_matmul_grad_buffers(values, dense, shape)?;
+        let output = ft_kernel_cpu::sparse_csr_matmul_dense(
+            &sparse,
+            self.tensor_tape.tensor(dense)?,
+        )?;
+        let crow = sparse.crow_indices().contiguous_values()?;
+        let columns = sparse.col_indices().contiguous_values()?;
+        let mut coordinates = Vec::with_capacity(sparse.nnz());
+        for row in 0..shape[0] {
+            for &column in &columns[crow[row] as usize..crow[row + 1] as usize] {
+                coordinates.push([row, column as usize]);
+            }
+        }
+        let out = self.record_sparse_matmul(values, dense, shape, coordinates, output)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "sparse_csr_mm values={} dense={} out={}",
+                values.0, dense.0, out.0
+            ),
+        );
+        Ok(out)
+    }
+
+    fn validate_sparse_matmul_grad_buffers(
+        &self,
+        values: TensorNodeId,
+        dense: TensorNodeId,
+        shape: [usize; 2],
+    ) -> Result<(), AutogradError> {
+        let values_tensor = self.tensor_tape.tensor(values)?;
+        let dense_tensor = self.tensor_tape.tensor(dense)?;
+        if !self.is_grad_enabled()
+            || (!self.tensor_requires_grad(values)? && !self.tensor_requires_grad(dense)?)
+        {
+            return Ok(());
+        }
+        let [_, columns] = dense_tensor.meta().shape() else {
+            return Err(Self::incompatible_tensor_args(
+                "sparse mm requires a matrix RHS",
+            ));
+        };
+        let output_numel =
+            Self::checked_mul(shape[0], *columns, "sparse mm output overflow")?;
+        let lanes = if values_tensor.meta().dtype().is_complex() {
+            2
+        } else {
+            1
+        };
+        for numel in [
+            values_tensor.meta().numel(),
+            dense_tensor.meta().numel(),
+            output_numel,
+        ] {
+            if numel
+                .checked_mul(lanes * std::mem::size_of::<f64>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+            {
+                return Err(Self::incompatible_tensor_args(
+                    "sparse mm gradient storage overflow",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_sparse_matmul(
+        &mut self,
+        values: TensorNodeId,
+        dense: TensorNodeId,
+        shape: [usize; 2],
+        coordinates: Vec<[usize; 2]>,
+        output: DenseTensor,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let needs = [
+            self.is_grad_enabled() && self.tensor_requires_grad(values)?,
+            self.is_grad_enabled() && self.tensor_requires_grad(dense)?,
+        ];
+        if !needs.iter().any(|&needed| needed) {
+            return Ok(self.tensor_tape.leaf_tensor(output, false));
+        }
+        let plan = Arc::new(SparseMatmulPlan {
+            coordinates,
+            rows: shape[0],
+            inner: shape[1],
+            columns: output.meta().shape()[1],
+        });
+        // Keep original handles so saved-value guards protect the caller's
+        // offset and strided tensors. Custom readers compact logical values
+        // without inserting detached input nodes.
+        if !output.meta().dtype().is_complex() {
+            return plan.record(
+                &mut self.tensor_tape,
+                SparseMatmulContraction::Product,
+                [values, dense],
+                Some(output.contiguous_values_as_f64()?),
+            );
+        }
+
+        // Complex cotangents use interleaved real/imaginary lanes:
+        // dvalues[e] = sum_j G[row,j] * conj(B[col,j]);
+        // dB[col,j] += conj(values[e]) * G[row,j].
+        let complex_values = |node| -> Result<Vec<Complex128>, AutogradError> {
+            let tensor = self.tensor_tape.compact_tensor(node)?;
+            Ok(match tensor.meta().dtype() {
+                DType::Complex64 => tensor
+                    .contiguous_values_complex64()?
+                    .iter()
+                    .map(|value| Complex128::new(f64::from(value.re), f64::from(value.im)))
+                    .collect(),
+                DType::Complex128 => tensor.contiguous_values_complex128()?.to_vec(),
+                _ => {
+                    return Err(Self::incompatible_tensor_args(
+                        "sparse complex backward requires complex operands",
+                    ));
+                }
+            })
+        };
+        let saved_values = if needs[1] {
+            complex_values(values)?
+        } else {
+            Vec::new()
+        };
+        let saved_dense = if needs[0] {
+            complex_values(dense)?
+        } else {
+            Vec::new()
+        };
+        let output = self.tensor_tape.apply_complex_bridge(
+            &[values, dense],
+            output,
+            move |ctx, gradients| {
+                let mut value_gradient = ctx.needs_input_grad()[0]
+                    .then(|| vec![0.0; 2 * plan.coordinates.len()]);
+                let mut dense_gradient = ctx.needs_input_grad()[1]
+                    .then(|| vec![0.0; 2 * (plan.inner * plan.columns)]);
+                for (entry, &[row, column]) in plan.coordinates.iter().enumerate() {
+                    for feature in 0..plan.columns {
+                        let row_offset = row * plan.columns + feature;
+                        let column_offset = column * plan.columns + feature;
+                        let real = gradients[0][2 * row_offset];
+                        let imag = gradients[0][2 * row_offset + 1];
+                        if let Some(gradient) = value_gradient.as_mut() {
+                            let value = saved_dense[column_offset];
+                            gradient[2 * entry] += real * value.re + imag * value.im;
+                            gradient[2 * entry + 1] += imag * value.re - real * value.im;
+                        }
+                        if let Some(gradient) = dense_gradient.as_mut() {
+                            let value = saved_values[entry];
+                            gradient[2 * column_offset] += value.re * real + value.im * imag;
+                            gradient[2 * column_offset + 1] += value.re * imag - value.im * real;
+                        }
+                    }
+                }
+                Ok(vec![value_gradient, dense_gradient])
+            },
+        )?;
+        let mut saved = Vec::new();
+        if needs[0] {
+            saved.push(dense);
+        }
+        if needs[1] {
+            saved.push(values);
+        }
+        self.tensor_tape
+            .save_custom_function_input_versions(output, &saved)?;
+        Ok(output)
     }
 
     // ── Data Augmentation Utilities ───────────────────────────────────────
