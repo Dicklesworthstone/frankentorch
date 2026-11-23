@@ -20762,12 +20762,14 @@ impl FrankenTorchSession {
 
     pub fn tensor_abs(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         // Complex |z| = hypot(re, im) -> real output (torch.abs(complex)); the
-        // unary dispatch rejects complex. Differentiable via the complex-bridge:
-        // d|z|/dz interleaved = (re/|z|, im/|z|) (0 at z=0). frankentorch-ng1hw.
+        // unary dispatch rejects complex. The VJP is grad * sgn(z), including
+        // IEEE propagation for nonfinite seeds at the origin. frankentorch-ng1hw.
         {
-            let tensor = self.tensor_tape.tensor(input)?;
-            let dtype = tensor.meta().dtype();
+            let dtype = self.tensor_tape.tensor(input)?.meta().dtype();
             if matches!(dtype, DType::Complex64 | DType::Complex128) {
+                // Read logical values, preserving the original node as the
+                // bridge parent and saved-version guard for strided views.
+                let tensor = self.tensor_tape.compact_tensor(input)?;
                 let meta = tensor.meta().clone();
                 let requires_grad = self.tensor_tape.tensor_requires_grad(input)?
                     && self.tensor_tape.is_grad_enabled();
@@ -20796,7 +20798,7 @@ impl FrankenTorchSession {
                 };
                 let output = DenseTensor::from_typed_storage(output_meta, output_storage)?;
                 let out = if requires_grad {
-                    self.tensor_tape.apply_complex_bridge(
+                    let out = self.tensor_tape.apply_complex_bridge(
                         &[input],
                         output,
                         move |_ctx, grad_outputs| {
@@ -20804,14 +20806,20 @@ impl FrankenTorchSession {
                             let mut grad_z = vec![0.0; g.len() * 2];
                             for (i, &(re, im)) in re_im.iter().enumerate() {
                                 let mag = re.hypot(im);
-                                if mag > 0.0 {
-                                    grad_z[2 * i] = g[i] * re / mag;
-                                    grad_z[2 * i + 1] = g[i] * im / mag;
-                                }
+                                let (sign_re, sign_im) = if mag == 0.0 {
+                                    (0.0, 0.0)
+                                } else {
+                                    (re / mag, im / mag)
+                                };
+                                grad_z[2 * i] = g[i] * sign_re;
+                                grad_z[2 * i + 1] = g[i] * sign_im;
                             }
                             Ok(vec![Some(grad_z)])
                         },
-                    )?
+                    )?;
+                    self.tensor_tape
+                        .save_custom_function_input_versions(out, &[input])?;
+                    out
                 } else {
                     self.tensor_tape.leaf_tensor(output, false)
                 };
@@ -21228,25 +21236,155 @@ impl FrankenTorchSession {
     ///
     /// For real-valued tensors this is exactly `torch.sign` (returns
     /// -1, 0, or +1). For complex inputs torch.sgn returns x/|x|
-    /// (preserving angle, with 0 for x=0); FrankenTorch's complex-
-    /// autograd surface is fail-loud, so the complex path here is
-    /// also fail-loud with a tracking-bead reference rather than a
-    /// silent partial implementation. Tracked under frankentorch-naub.
+    /// (preserving angle, with 0 for x=0). Complex64 and Complex128
+    /// preserve their precision and support first-order complex gradients.
+    /// Higher-order complex differentiation reports an explicit error.
     pub fn tensor_sgn(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let dtype = self.tensor_dtype(input)?;
         match dtype {
             DType::F32 | DType::F64 => self.tensor_sign(input),
-            DType::Complex64 | DType::Complex128 => Err(AutogradError::Dispatch(
-                ft_dispatch::DispatchError::Key(ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "sgn: complex inputs not supported (would require x/|x| with Wirtinger semantics). Tracked under frankentorch-naub.",
-                }),
-            )),
+            DType::Complex64 | DType::Complex128 => self.tensor_complex_phase(input, true),
             _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "sgn requires f32, f64, or complex tensors",
                 },
             ))),
         }
+    }
+
+    /// Shared typed phase/unit-phase bridge. Read logical values without adding
+    /// a detached node, then retain the original input identity for mutation checks.
+    fn tensor_complex_phase(
+        &mut self,
+        input: TensorNodeId,
+        unit_sign: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let requires_grad =
+            self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
+        let input_meta = self.tensor_tape.tensor_meta(input)?;
+        if requires_grad {
+            // Complex cotangents have two F64 lanes even for Complex64 inputs.
+            let numel = Self::checked_shape_numel(
+                input_meta.shape(),
+                "complex phase gradient element count overflow",
+            )?;
+            if numel > (isize::MAX as usize) / (2 * std::mem::size_of::<f64>()) {
+                return Err(Self::incompatible_tensor_args(
+                    "complex phase gradient storage capacity overflow",
+                ));
+            }
+        }
+        let tensor = self.tensor_tape.compact_tensor(input)?;
+        let meta = tensor.meta();
+
+        macro_rules! phase_storage {
+            ($values:expr, $real:ident, $complex:ident) => {
+                if unit_sign {
+                    TensorStorage::$complex(Arc::new(
+                        $values
+                            .iter()
+                            .map(|z| {
+                                if z.re == 0.0 && z.im == 0.0 {
+                                    $complex::new(0.0, 0.0)
+                                } else {
+                                    let magnitude = z.re.hypot(z.im);
+                                    $complex::new(z.re / magnitude, z.im / magnitude)
+                                }
+                            })
+                            .collect(),
+                    ))
+                } else {
+                    TensorStorage::$real(Arc::new(
+                        $values.iter().map(|z| z.im.atan2(z.re)).collect(),
+                    ))
+                }
+            };
+        }
+        let storage = match tensor.typed_storage() {
+            TensorStorage::Complex64(values) => phase_storage!(values, F32, Complex64),
+            TensorStorage::Complex128(values) => phase_storage!(values, F64, Complex128),
+            _ => {
+                return Err(AutogradError::DenseTensor(
+                    ft_core::DenseTensorError::UnsupportedDType(meta.dtype()),
+                ));
+            }
+        };
+        let output = DenseTensor::from_typed_storage(
+            TensorMeta::from_shape(meta.shape().to_vec(), storage.dtype(), meta.device()),
+            storage,
+        )?;
+
+        let out = if requires_grad {
+            let saved = tensor.typed_storage().clone();
+            let out = self.tensor_tape.apply_complex_bridge(
+                &[input],
+                output,
+                move |_ctx, gradients| {
+                    // PyTorch's conjugate-Wirtinger VJPs, in the forward dtype:
+                    // angle: g*z/|z|^2 * i; sgn: (g - sgn(z)^2*conj(g))/(2|z|).
+                    // Both define zero gradient at z=0, including nonfinite seeds.
+                    macro_rules! phase_gradient {
+                        ($values:expr, $complex:ident, $narrow:expr, $widen:expr) => {{
+                            let mut result = Vec::with_capacity($values.len() * 2);
+                            for (index, z) in $values.iter().enumerate() {
+                                if z.re == 0.0 && z.im == 0.0 {
+                                    result.extend([0.0, 0.0]);
+                                    continue;
+                                }
+                                let magnitude = z.re.hypot(z.im);
+                                let derivative = if unit_sign {
+                                    let incoming = $complex::new(
+                                        ($narrow)(gradients[0][index * 2]),
+                                        ($narrow)(gradients[0][index * 2 + 1]),
+                                    );
+                                    let normalized =
+                                        $complex::new(z.re / magnitude, z.im / magnitude);
+                                    (incoming - normalized * normalized * incoming.conj())
+                                        / (2.0 * magnitude)
+                                } else {
+                                    let incoming =
+                                        $complex::new(($narrow)(gradients[0][index]), 0.0);
+                                    (incoming * *z) / (magnitude * magnitude)
+                                        * $complex::new(0.0, 1.0)
+                                };
+                                result.extend([
+                                    ($widen)(derivative.re),
+                                    ($widen)(derivative.im),
+                                ]);
+                            }
+                            result
+                        }};
+                    }
+                    let gradient = match &saved {
+                        TensorStorage::Complex64(values) => phase_gradient!(
+                            values,
+                            Complex64,
+                            |value: f64| value as f32,
+                            f64::from
+                        ),
+                        TensorStorage::Complex128(values) => phase_gradient!(
+                            values,
+                            Complex128,
+                            |value: f64| value,
+                            |value: f64| value
+                        ),
+                        _ => unreachable!("complex phase only saves complex storage"),
+                    };
+                    Ok(vec![Some(gradient)])
+                },
+            )?;
+            self.tensor_tape
+                .save_custom_function_input_versions(out, &[input])?;
+            out
+        } else {
+            self.tensor_tape.leaf_tensor(output, false)
+        };
+        let operation = if unit_sign { "sgn" } else { "angle" };
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("{operation}(complex) input={} out={}", input.0, out.0),
+        );
+        Ok(out)
     }
 
     pub fn tensor_trunc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
@@ -25932,9 +26070,12 @@ impl FrankenTorchSession {
         Ok(())
     }
 
-    /// Element-wise angle (in radians) for real tensors.
+    /// Element-wise phase angle (in radians) for real or complex tensors.
     ///
-    /// Equivalent to `torch.angle(input)` for real-valued tensors:
+    /// For Complex64/Complex128, returns F32/F64 `atan2(imag, real)` with
+    /// first-order complex gradients and a zero gradient at the origin.
+    /// Higher-order complex differentiation reports an explicit error.
+    /// For real-valued tensors:
     /// returns 0 where `x >= 0`, `π` where `x < 0`, and NaN where
     /// `x` is NaN. Composes through autograd-aware `tensor_atan2`
     /// with a zero left operand: `angle(x) = atan2(0, x)`. Useful
@@ -25944,11 +26085,7 @@ impl FrankenTorchSession {
     pub fn tensor_angle(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let dtype = self.tensor_dtype(input)?;
         if matches!(dtype, DType::Complex64 | DType::Complex128) {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "angle: complex inputs not supported (would require atan2(imag, real) with Wirtinger semantics). Tracked under frankentorch-66hu.",
-                },
-            )));
+            return self.tensor_complex_phase(input, false);
         }
         // For real inputs, torch.angle returns 0 if x >= 0 and π if
         // x < 0. The previous formulation atan2(0, x) gave π for both
@@ -147863,10 +148000,7 @@ mod tests {
     }
 
     #[test]
-    fn sgn_complex_input_fails_loud() {
-        // FrankenTorch's complex autograd surface is fail-loud; sgn
-        // mirrors that policy instead of silently routing complex
-        // inputs to a partial implementation.
+    fn sgn_complex_input_preserves_unit_phase() {
         use std::sync::Arc;
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let cplx = ft_core::DenseTensor::from_typed_storage(
@@ -147875,12 +148009,12 @@ mod tests {
         )
         .unwrap();
         let id = s.tensor_variable_from_storage(cplx, false);
-        let err = s.tensor_sgn(id).expect_err("complex sgn must fail loud");
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("complex"),
-            "complex sgn rejection should mention complex, got {msg}"
-        );
+        let output = s.tensor_sgn(id).unwrap();
+        let result = s.tensor_snapshot(output).unwrap();
+        let value = result.contiguous_values_complex64().unwrap()[0];
+        assert_eq!(result.meta().dtype(), DType::Complex64);
+        assert!((value.re - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-7);
+        assert!((value.im - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-7);
     }
 
     // ── tensor_true_divide / tensor_floor_divide tests (frankentorch-uw1c) ──
