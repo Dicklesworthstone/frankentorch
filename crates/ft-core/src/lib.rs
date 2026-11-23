@@ -636,6 +636,11 @@ impl TensorMeta {
         if self.shape.len() != self.strides.len() {
             return false;
         }
+        // Empty views have no conflicting element order, regardless of the
+        // strides retained from their backing tensor.
+        if self.numel == 0 {
+            return true;
+        }
 
         let mut expected_stride = 1usize;
         for (size, stride) in self
@@ -657,6 +662,37 @@ impl TensorMeta {
                 return false;
             };
             expected_stride = next_expected;
+        }
+        true
+    }
+
+    /// Whether logical elements occupy one dense, non-overlapping span.
+    /// Dimension permutations are allowed; stepped and broadcast views are not.
+    #[must_use]
+    pub fn is_non_overlapping_and_dense(&self) -> bool {
+        if self.shape.len() != self.strides.len() {
+            return false;
+        }
+        if self.numel == 0 {
+            return true;
+        }
+        let mut dimensions: Vec<_> = self
+            .shape
+            .iter()
+            .copied()
+            .zip(self.strides.iter().copied())
+            .filter(|&(size, _)| size > 1)
+            .collect();
+        dimensions.sort_unstable_by_key(|&(_, stride)| stride);
+        let mut expected_stride = 1usize;
+        for (size, stride) in dimensions {
+            if stride != expected_stride {
+                return false;
+            }
+            let Some(next) = expected_stride.checked_mul(size) else {
+                return false;
+            };
+            expected_stride = next;
         }
         true
     }
@@ -1230,6 +1266,46 @@ fn checked_shape_numel(shape: &[usize]) -> Result<usize, DenseTensorError> {
             })?;
     }
     Ok(product)
+}
+
+fn gather_logical_storage<T: Copy>(
+    meta: &TensorMeta,
+    storage: &[T],
+) -> Result<Vec<T>, DenseTensorError> {
+    let numel = meta.numel();
+    if numel == 0 {
+        return Ok(Vec::new());
+    }
+    if meta.is_contiguous() {
+        let end = contiguous_required_len(meta)?;
+        return storage
+            .get(meta.storage_offset()..end)
+            .map(<[T]>::to_vec)
+            .ok_or(DenseTensorError::InsufficientStorage {
+                needed: end,
+                actual: storage.len(),
+            });
+    }
+    let mut values = Vec::with_capacity(numel);
+    let mut index = vec![0; meta.shape().len()];
+    for _ in 0..numel {
+        let offset = meta.storage_index_for(&index)?;
+        let &value = storage
+            .get(offset)
+            .ok_or(DenseTensorError::InsufficientStorage {
+                needed: offset.saturating_add(1),
+                actual: storage.len(),
+            })?;
+        values.push(value);
+        for dim in (0..index.len()).rev() {
+            index[dim] += 1;
+            if index[dim] < meta.shape()[dim] {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    Ok(values)
 }
 
 enum TensorCopyPlan {
@@ -1866,6 +1942,46 @@ impl DenseTensor {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Materialize logical row-major storage without converting any values.
+    ///
+    /// The result has zero storage offset and contiguous strides, preserving
+    /// shape, dtype, device, quantization parameters and every stored bit. A
+    /// tensor that already owns a compact contiguous span shares its storage
+    /// through copy-on-write; views are copied without their backing padding.
+    pub fn to_contiguous(&self) -> Result<Self, DenseTensorError> {
+        if self.meta.is_contiguous()
+            && self.meta.storage_offset() == 0
+            && self.storage.len() == self.meta.numel()
+        {
+            return Ok(self.clone());
+        }
+        let mut meta = TensorMeta::from_shape(
+            self.meta.shape().to_vec(),
+            self.meta.dtype(),
+            self.meta.device(),
+        );
+        if let Some(quantization) = self.meta.quantization() {
+            meta = meta.with_quantization(quantization.clone());
+        }
+        macro_rules! gather {
+            ($values:expr, $variant:ident) => {
+                TensorStorage::$variant(Arc::new(gather_logical_storage(&self.meta, $values)?))
+            };
+        }
+        let storage = match &self.storage {
+            TensorStorage::F64(values) => gather!(values, F64),
+            TensorStorage::F64Inline4(values) => gather!(values, F64),
+            TensorStorage::F32(values) => gather!(values, F32),
+            TensorStorage::F16(values) => gather!(values, F16),
+            TensorStorage::BF16(values) => gather!(values, BF16),
+            TensorStorage::Complex64(values) => gather!(values, Complex64),
+            TensorStorage::Complex128(values) => gather!(values, Complex128),
+            TensorStorage::QInt8(values) => gather!(values, QInt8),
+            TensorStorage::QUInt8(values) => gather!(values, QUInt8),
+        };
+        Self::from_typed_storage(meta, storage)
     }
 
     /// Cast this tensor to a different floating-point or complex dtype.
@@ -2716,6 +2832,7 @@ fn sparse_values_to_dense(
     values: &DenseTensor,
     shape: Vec<usize>,
     destinations: &[usize],
+    coalesced: bool,
 ) -> Result<DenseTensor, SparseTensorError> {
     let numel = checked_shape_numel(&shape)?;
     let meta = values.meta();
@@ -2741,7 +2858,11 @@ fn sparse_values_to_dense(
             for (entry, &destination) in destinations.iter().enumerate() {
                 let source = meta.storage_offset() + entry * meta.strides()[0];
                 for (column, &offset) in block_offsets.iter().enumerate() {
-                    output[destination + column] += storage[source + offset];
+                    if coalesced {
+                        output[destination + column] = storage[source + offset];
+                    } else {
+                        output[destination + column] += storage[source + offset];
+                    }
                 }
             }
             TensorStorage::$variant(Arc::new(output))
@@ -3077,6 +3198,7 @@ impl SparseCOOTensor {
     ///
     /// Duplicate coordinates accumulate in the stored dtype and order. Logical
     /// value strides and offsets are honored, including hybrid dense blocks.
+    /// Coalesced values are copied without arithmetic to preserve their bits.
     pub fn to_dense(&self) -> Result<DenseTensor, SparseTensorError> {
         checked_shape_numel(&self.dense_shape)?;
         let indices = self.indices.contiguous_values()?;
@@ -3088,7 +3210,12 @@ impl SparseCOOTensor {
                     .sum()
             })
             .collect();
-        sparse_values_to_dense(&self.values, self.dense_shape.clone(), &destinations)
+        sparse_values_to_dense(
+            &self.values,
+            self.dense_shape.clone(),
+            &destinations,
+            self.coalesced,
+        )
     }
 }
 
@@ -3344,7 +3471,7 @@ impl SparseCSRTensor {
                 destinations.push(row * self.ncols() + column as usize);
             }
         }
-        sparse_values_to_dense(&self.values, self.shape.to_vec(), &destinations)
+        sparse_values_to_dense(&self.values, self.shape.to_vec(), &destinations, false)
     }
 
     /// Convert a two-dimensional floating-point or complex dense tensor to CSR.
@@ -3378,11 +3505,7 @@ impl SparseCSRTensor {
         let device = tensor.meta().device();
         Self::new(
             DenseI64Tensor::from_contiguous_values(crow, vec![crow_len], device)?,
-            DenseI64Tensor::from_contiguous_values(
-                indices[nnz..].to_vec(),
-                vec![nnz],
-                device,
-            )?,
+            DenseI64Tensor::from_contiguous_values(indices[nnz..].to_vec(), vec![nnz], device)?,
             coo.values().clone(),
             [shape[0], shape[1]],
         )
@@ -5751,6 +5874,166 @@ mod tests {
         assert_eq!(c_slice[1].im, 0.0);
     }
 
+    fn native_storage_lane_bits(storage: &TensorStorage) -> Vec<u128> {
+        match storage {
+            TensorStorage::F64(values) => values.iter().map(|v| u128::from(v.to_bits())).collect(),
+            TensorStorage::F64Inline4(values) => {
+                values.iter().map(|v| u128::from(v.to_bits())).collect()
+            }
+            TensorStorage::F32(values) => values.iter().map(|v| u128::from(v.to_bits())).collect(),
+            TensorStorage::F16(values) => values.iter().map(|v| u128::from(v.to_bits())).collect(),
+            TensorStorage::BF16(values) => values.iter().map(|v| u128::from(v.to_bits())).collect(),
+            TensorStorage::QInt8(values) => values.iter().map(|&v| u128::from(v as u8)).collect(),
+            TensorStorage::QUInt8(values) => values.iter().map(|&v| u128::from(v)).collect(),
+            TensorStorage::Complex64(values) => values
+                .iter()
+                .map(|v| u128::from(v.re.to_bits()) | (u128::from(v.im.to_bits()) << 32))
+                .collect(),
+            TensorStorage::Complex128(values) => values
+                .iter()
+                .map(|v| u128::from(v.re.to_bits()) | (u128::from(v.im.to_bits()) << 64))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn to_contiguous_preserves_typed_view_bits_and_quantization() {
+        let nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+            DType::QInt8,
+            DType::QUInt8,
+        ] {
+            let storage = match dtype {
+                DType::QInt8 => {
+                    TensorStorage::QInt8(Arc::new(vec![99, -2, 7, 99, 10, 20, 99, 30, 40]))
+                }
+                DType::QUInt8 => {
+                    TensorStorage::QUInt8(Arc::new(vec![99, 2, 7, 99, 10, 20, 99, 30, 40]))
+                }
+                _ => DenseTensor::from_contiguous_values_complex128(
+                    [99.0, -0.0, nan, 99.0, 1.0, 2.0, 99.0, 3.0, 4.0]
+                        .into_iter()
+                        .map(|value| Complex128::new(value, -value))
+                        .collect(),
+                    vec![9],
+                    Device::Metal,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .typed_storage()
+                .clone(),
+            };
+            // Quantized metadata must be constructed with its parameters before validation.
+            let meta = if dtype.is_quantized() {
+                TensorMeta::quantized_per_channel_from_shape_and_strides(
+                    vec![2, 3],
+                    vec![1, 3],
+                    1,
+                    dtype,
+                    Device::Metal,
+                    vec![0.125, 0.25, 0.5],
+                    vec![2, 3, 4],
+                    1,
+                )
+                .unwrap()
+            } else {
+                TensorMeta::from_shape_and_strides(vec![2, 3], vec![1, 3], 1, dtype, Device::Metal)
+                    .unwrap()
+            };
+            let original_bits = native_storage_lane_bits(&storage);
+            let expected: Vec<_> = [1, 4, 7, 2, 5, 8]
+                .into_iter()
+                .map(|index| original_bits[index])
+                .collect();
+            let view = DenseTensor::from_typed_storage(meta, storage).unwrap();
+            let output = view.to_contiguous().unwrap();
+            assert_eq!(
+                native_storage_lane_bits(output.typed_storage()),
+                expected,
+                "{dtype:?}"
+            );
+            assert_eq!(output.meta().shape(), &[2, 3]);
+            assert_eq!(output.meta().strides(), &[3, 1]);
+            assert_eq!(output.meta().storage_offset(), 0);
+            assert_eq!(output.meta().dtype(), dtype);
+            assert_eq!(output.meta().device(), Device::Metal);
+            assert_eq!(output.meta().quantization(), view.meta().quantization());
+            assert_eq!(
+                native_storage_lane_bits(view.typed_storage()),
+                original_bits
+            );
+        }
+    }
+
+    #[test]
+    fn to_contiguous_handles_broadcast_empty_scalar_and_offset_views() {
+        let broadcast = DenseTensor::from_storage_f32(
+            TensorMeta::from_shape_and_strides(vec![3, 2], vec![0, 1], 1, DType::F32, Device::Cpu)
+                .unwrap(),
+            vec![99.0, 2.0, -3.0, 99.0],
+        )
+        .unwrap();
+        let output = broadcast.to_contiguous().unwrap();
+        assert_eq!(
+            output.contiguous_values_f32().unwrap(),
+            &[2.0, -3.0, 2.0, -3.0, 2.0, -3.0]
+        );
+        let offset = DenseTensor::from_storage_f32(
+            TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu).with_storage_offset(1),
+            vec![99.0, 2.0, -3.0, 99.0],
+        )
+        .unwrap();
+        let packed = offset.to_contiguous().unwrap();
+        assert_eq!(packed.meta().storage_offset(), 0);
+        assert_eq!(packed.typed_storage().len(), 2);
+        assert_eq!(packed.contiguous_values_f32().unwrap(), &[2.0, -3.0]);
+
+        let scalar = DenseTensor::from_contiguous_values(vec![2.5], vec![], Device::Cpu).unwrap();
+        let mut copy = scalar.to_contiguous().unwrap();
+        assert!(copy.shares_storage_with(&scalar));
+        copy.update_contiguous_values(&[7.0]).unwrap();
+        assert_eq!(scalar.contiguous_values().unwrap(), &[2.5]);
+        assert_eq!(copy.contiguous_values().unwrap(), &[7.0]);
+
+        let empty = DenseTensor::from_storage_f32(
+            TensorMeta::from_shape_and_strides(
+                vec![2, 0, 3],
+                vec![1, 7, 2],
+                0,
+                DType::F32,
+                Device::Cpu,
+            )
+            .unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let empty = empty.to_contiguous().unwrap();
+        assert_eq!(empty.meta().shape(), &[2, 0, 3]);
+        assert_eq!(empty.meta().storage_offset(), 0);
+        assert!(empty.meta().is_contiguous());
+        assert!(empty.typed_storage().is_empty());
+        let empty_meta = TensorMeta::from_shape_and_strides(
+            vec![0, 3],
+            vec![71, 19],
+            0,
+            DType::F32,
+            Device::Cpu,
+        )
+        .unwrap();
+        assert!(empty_meta.is_contiguous());
+        assert!(
+            TensorMeta::from_shape_and_strides(vec![0, 3], vec![1], 0, DType::F32, Device::Cpu,)
+                .is_err()
+        );
+    }
+
     // ── Sparse Tensor Tests ────────────────────────────────────────────────
 
     #[test]
@@ -5932,6 +6215,63 @@ mod tests {
         let expected = vec![0.0, 3.5, 0.0, 0.0];
         let actual = dense.contiguous_values().unwrap();
         assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn sparse_coo_to_dense_accumulates_strided_blocks_in_storage_dtype() {
+        for (dtype, large) in [
+            (DType::F64, 9_007_199_254_740_992.0),
+            (DType::F32, 16_777_216.0),
+            (DType::F16, 2048.0),
+            (DType::BF16, 256.0),
+            (DType::Complex64, 16_777_216.0),
+            (DType::Complex128, 9_007_199_254_740_992.0),
+        ] {
+            let backing = DenseTensor::from_contiguous_values_complex128(
+                [99.0, large, 1.0, -large, 99.0, 1.0, 2.0, 3.0]
+                    .into_iter()
+                    .map(|value| Complex128::new(value, value * 2.0))
+                    .collect(),
+                vec![8],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let meta =
+                TensorMeta::from_shape_and_strides(vec![3, 2], vec![1, 4], 1, dtype, Device::Cpu)
+                    .unwrap();
+            let values =
+                DenseTensor::from_typed_storage(meta, backing.typed_storage().clone()).unwrap();
+            let sparse = SparseCOOTensor::new(
+                DenseI64Tensor::from_contiguous_values(vec![1, 1, 1], vec![1, 3], Device::Cpu)
+                    .unwrap(),
+                values,
+                vec![2, 2],
+                false,
+            )
+            .unwrap();
+            // Native accumulation discards +1 (and +2i) at the precision limit
+            // before cancellation. Accumulating widened values would yield 1.
+            let expected = DenseTensor::from_contiguous_values_complex128(
+                vec![Complex128::new(0.0, 0.0); 3]
+                    .into_iter()
+                    .chain([Complex128::new(6.0, 12.0)])
+                    .collect(),
+                vec![2, 2],
+                Device::Cpu,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+            let actual = sparse.to_dense().unwrap();
+            assert_eq!(actual.meta().dtype(), dtype);
+            assert_eq!(
+                actual.typed_storage(),
+                expected.typed_storage(),
+                "{dtype:?}"
+            );
+        }
     }
 
     #[test]
@@ -6395,14 +6735,8 @@ mod tests {
             .to_dtype(dtype)
             .unwrap();
             let values = DenseTensor::from_typed_storage(
-                TensorMeta::from_shape_and_strides(
-                    vec![3, 2],
-                    vec![3, 1],
-                    1,
-                    dtype,
-                    Device::Cpu,
-                )
-                .unwrap(),
+                TensorMeta::from_shape_and_strides(vec![3, 2], vec![3, 1], 1, dtype, Device::Cpu)
+                    .unwrap(),
                 backing.typed_storage().clone(),
             )
             .unwrap();
@@ -6429,14 +6763,8 @@ mod tests {
         }
 
         let values = DenseTensor::from_storage_complex64(
-            TensorMeta::from_shape_and_strides(
-                vec![3],
-                vec![2],
-                1,
-                DType::Complex64,
-                Device::Cpu,
-            )
-            .unwrap(),
+            TensorMeta::from_shape_and_strides(vec![3], vec![2], 1, DType::Complex64, Device::Cpu)
+                .unwrap(),
             vec![
                 Complex64::new(99.0, 99.0),
                 Complex64::new(16_777_216.0, 2.0),
@@ -6448,15 +6776,18 @@ mod tests {
         )
         .unwrap();
         let sparse = SparseCOOTensor::new(
-            DenseI64Tensor::from_contiguous_values(vec![0, 0, 0], vec![1, 3], Device::Cpu)
-                .unwrap(),
+            DenseI64Tensor::from_contiguous_values(vec![0, 0, 0], vec![1, 3], Device::Cpu).unwrap(),
             values,
             vec![1],
             false,
         )
         .unwrap();
         assert_eq!(
-            sparse.to_dense().unwrap().contiguous_values_complex64().unwrap(),
+            sparse
+                .to_dense()
+                .unwrap()
+                .contiguous_values_complex64()
+                .unwrap(),
             &[Complex64::new(0.0, 9.0)],
         );
     }
@@ -6464,20 +6795,13 @@ mod tests {
     #[test]
     fn sparse_to_dense_handles_broadcast_values_and_empty_blocks() {
         let values = DenseTensor::from_storage_f32(
-            TensorMeta::from_shape_and_strides(
-                vec![2, 2],
-                vec![0, 0],
-                1,
-                DType::F32,
-                Device::Cpu,
-            )
-            .unwrap(),
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![0, 0], 1, DType::F32, Device::Cpu)
+                .unwrap(),
             vec![99.0, 3.0],
         )
         .unwrap();
         let sparse = SparseCOOTensor::new(
-            DenseI64Tensor::from_contiguous_values(vec![1, 1], vec![1, 2], Device::Cpu)
-                .unwrap(),
+            DenseI64Tensor::from_contiguous_values(vec![1, 1], vec![1, 2], Device::Cpu).unwrap(),
             values,
             vec![3, 2],
             false,
@@ -6490,8 +6814,7 @@ mod tests {
 
         let scalar = SparseCOOTensor::new(
             DenseI64Tensor::from_contiguous_values(vec![], vec![0, 2], Device::Cpu).unwrap(),
-            DenseTensor::from_contiguous_values_f32(vec![2.0, 3.0], vec![2], Device::Cpu)
-                .unwrap(),
+            DenseTensor::from_contiguous_values_f32(vec![2.0, 3.0], vec![2], Device::Cpu).unwrap(),
             vec![],
             false,
         )
@@ -6502,8 +6825,7 @@ mod tests {
         );
 
         let empty = SparseCOOTensor::new(
-            DenseI64Tensor::from_contiguous_values(vec![0, 1], vec![1, 2], Device::Cpu)
-                .unwrap(),
+            DenseI64Tensor::from_contiguous_values(vec![0, 1], vec![1, 2], Device::Cpu).unwrap(),
             DenseTensor::from_contiguous_values_f32(vec![], vec![2, 0], Device::Cpu).unwrap(),
             vec![2, 0],
             true,
@@ -6518,14 +6840,8 @@ mod tests {
     fn sparse_csr_to_dense_uses_native_strided_values() {
         let nan = f32::from_bits(0x7fc0_0042);
         let values = DenseTensor::from_storage_f32(
-            TensorMeta::from_shape_and_strides(
-                vec![2],
-                vec![2],
-                1,
-                DType::F32,
-                Device::Cpu,
-            )
-            .unwrap(),
+            TensorMeta::from_shape_and_strides(vec![2], vec![2], 1, DType::F32, Device::Cpu)
+                .unwrap(),
             vec![99.0, nan, 99.0, -0.0],
         )
         .unwrap();
@@ -6569,14 +6885,8 @@ mod tests {
             .to_dtype(dtype)
             .unwrap();
             let view = DenseTensor::from_typed_storage(
-                TensorMeta::from_shape_and_strides(
-                    vec![2, 2],
-                    vec![1, 3],
-                    1,
-                    dtype,
-                    Device::Cpu,
-                )
-                .unwrap(),
+                TensorMeta::from_shape_and_strides(vec![2, 2], vec![1, 3], 1, dtype, Device::Cpu)
+                    .unwrap(),
                 backing.typed_storage().clone(),
             )
             .unwrap();
@@ -6604,29 +6914,24 @@ mod tests {
     #[test]
     fn sparse_csr_to_coo_preserves_unsorted_rows_and_value_views() {
         let values = DenseTensor::from_storage_f32(
-            TensorMeta::from_shape_and_strides(
-                vec![3],
-                vec![2],
-                1,
-                DType::F32,
-                Device::Cpu,
-            )
-            .unwrap(),
+            TensorMeta::from_shape_and_strides(vec![3], vec![2], 1, DType::F32, Device::Cpu)
+                .unwrap(),
             vec![99.0, 5.0, 99.0, 6.0, 99.0, 7.0],
         )
         .unwrap();
         let csr = SparseCSRTensor::new(
-            DenseI64Tensor::from_contiguous_values(vec![0, 2, 2, 3], vec![4], Device::Cpu)
-                .unwrap(),
-            DenseI64Tensor::from_contiguous_values(vec![2, 0, 1], vec![3], Device::Cpu)
-                .unwrap(),
+            DenseI64Tensor::from_contiguous_values(vec![0, 2, 2, 3], vec![4], Device::Cpu).unwrap(),
+            DenseI64Tensor::from_contiguous_values(vec![2, 0, 1], vec![3], Device::Cpu).unwrap(),
             values,
             [3, 3],
         )
         .unwrap();
         let coo = csr.to_coo().unwrap();
         assert!(!coo.is_coalesced());
-        assert_eq!(coo.indices().contiguous_values().unwrap(), &[0, 0, 2, 2, 0, 1]);
+        assert_eq!(
+            coo.indices().contiguous_values().unwrap(),
+            &[0, 0, 2, 2, 0, 1]
+        );
         assert_eq!(coo.values().meta(), csr.values().meta());
         assert_eq!(coo.values().storage_id(), csr.values().storage_id());
         assert_eq!(
@@ -6638,12 +6943,14 @@ mod tests {
     #[test]
     fn sparse_csr_from_dense_handles_empty_axes_and_rejects_nonmatrices() {
         for shape in [vec![0, 3], vec![3, 0], vec![0, 0]] {
-            let dense =
-                DenseTensor::from_contiguous_values_f32(vec![], shape.clone(), Device::Cpu)
-                    .unwrap();
+            let dense = DenseTensor::from_contiguous_values_f32(vec![], shape.clone(), Device::Cpu)
+                .unwrap();
             let csr = SparseCSRTensor::from_dense(&dense).unwrap();
             assert_eq!(csr.nnz(), 0);
-            assert_eq!(csr.crow_indices().contiguous_values().unwrap(), vec![0; shape[0] + 1]);
+            assert_eq!(
+                csr.crow_indices().contiguous_values().unwrap(),
+                vec![0; shape[0] + 1]
+            );
             assert_eq!(csr.to_dense().unwrap().meta().shape(), shape.as_slice());
             let coo = csr.to_coo().unwrap();
             assert!(coo.is_coalesced());
