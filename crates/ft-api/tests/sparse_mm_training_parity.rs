@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use ft_api::FrankenTorchSession;
-use ft_autograd::{BackwardOptions, TensorNodeId};
+use ft_autograd::{AutogradError, BackwardOptions, TensorNodeId};
 use ft_core::{
     Complex64, Complex128, DType, DenseI64Tensor, DenseTensor, Device, ExecutionMode, TensorMeta,
     TensorStorage,
@@ -155,9 +155,8 @@ fn sparse_mm_accepts_logical_strides_and_routes_offset_view_gradients() {
         .unwrap()
         .to_dtype(dtype)
         .unwrap();
-        let value_meta = TensorMeta::from_shape(vec![4], dtype, Device::Cpu)
-            .with_strides(vec![2])
-            .with_storage_offset(1);
+        let value_meta =
+            TensorMeta::from_shape_and_strides(vec![4], vec![2], 1, dtype, Device::Cpu).unwrap();
         let values = session.tensor_variable_from_storage(
             DenseTensor::from_typed_storage(value_meta, value_storage.typed_storage().clone())
                 .unwrap(),
@@ -171,9 +170,9 @@ fn sparse_mm_accepts_logical_strides_and_routes_offset_view_gradients() {
         .unwrap()
         .to_dtype(dtype)
         .unwrap();
-        let dense_meta = TensorMeta::from_shape(vec![3, 2], dtype, Device::Cpu)
-            .with_strides(vec![1, 3])
-            .with_storage_offset(1);
+        let dense_meta =
+            TensorMeta::from_shape_and_strides(vec![3, 2], vec![1, 3], 1, dtype, Device::Cpu)
+                .unwrap();
         let dense = session.tensor_variable_from_storage(
             DenseTensor::from_typed_storage(dense_meta, dense_storage.typed_storage().clone())
                 .unwrap(),
@@ -478,6 +477,105 @@ fn sparse_adjoints_reject_mutated_saved_frozen_operands() {
     }
 }
 
+#[test]
+fn sparse_adjoints_guard_original_strided_operands_after_state_reload() {
+    let coo = indices(&[0, 1, 1, 0], &[2, 2]);
+    let crow = indices(&[0, 1, 2], &[3]);
+    let columns = indices(&[1, 0], &[2]);
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F32, DType::F64] {
+            for frozen_values in [false, true] {
+                for create_graph in [false, true] {
+                    for use_csr in [false, true] {
+                        let mut session = FrankenTorchSession::new(mode);
+                        let value_storage = DenseTensor::from_contiguous_values(
+                            vec![99., 2., 99., 3.],
+                            vec![4],
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        let values = DenseTensor::from_typed_storage(
+                            TensorMeta::from_shape_and_strides(
+                                vec![2],
+                                vec![2],
+                                1,
+                                dtype,
+                                Device::Cpu,
+                            )
+                            .unwrap(),
+                            value_storage.typed_storage().clone(),
+                        )
+                        .unwrap();
+                        let dense_storage = DenseTensor::from_contiguous_values(
+                            vec![99., 1., 4., 99., 2., 5.],
+                            vec![6],
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        let dense = DenseTensor::from_typed_storage(
+                            TensorMeta::from_shape_and_strides(
+                                vec![2, 2],
+                                vec![1, 3],
+                                1,
+                                dtype,
+                                Device::Cpu,
+                            )
+                            .unwrap(),
+                            dense_storage.typed_storage().clone(),
+                        )
+                        .unwrap();
+                        let values = session.tensor_variable_from_storage(values, !frozen_values);
+                        let dense = session.tensor_variable_from_storage(dense, frozen_values);
+                        let output = if use_csr {
+                            session.tensor_sparse_csr_mm(&crow, &columns, values, [2, 2], dense)
+                        } else {
+                            session.tensor_sparse_coo_mm(&coo, values, [2, 2], dense)
+                        }
+                        .unwrap();
+                        let loss = session.tensor_sum(output).unwrap();
+                        let frozen = if frozen_values { values } else { dense };
+                        let original = session.tensor_snapshot(frozen).unwrap();
+                        assert!(!original.meta().is_contiguous());
+                        let replacement = DenseTensor::from_contiguous_values(
+                            vec![9.; original.meta().numel()],
+                            original.meta().shape().to_vec(),
+                            Device::Cpu,
+                        )
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap();
+                        session.tensor_load_state(&[(frozen, replacement)]).unwrap();
+                        assert_eq!(
+                            session.tensor_snapshot(frozen).unwrap().meta(),
+                            original.meta()
+                        );
+                        let mut options = BackwardOptions::for_mode(mode);
+                        options.create_graph = create_graph;
+                        let error = session
+                            .tensor_backward_with_options(loss, options)
+                            .unwrap_err();
+                        assert!(
+                            matches!(
+                                error,
+                                AutogradError::BorrowedInputVersionMismatch {
+                                    node,
+                                    recorded: 0,
+                                    observed: 1,
+                                } if node == frozen
+                            ),
+                            "{dtype:?}, {mode:?}, CSR={use_csr}, frozen_values={frozen_values}, create_graph={create_graph}: {error:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn complex_tensor(
     session: &mut FrankenTorchSession,
     values: &[(f64, f64)],
@@ -506,6 +604,91 @@ fn complex_tensor(
     )
     .unwrap();
     session.tensor_variable_from_storage(tensor, requires_grad)
+}
+
+#[test]
+fn complex_csr_unsorted_columns_and_empty_rows_preserve_conjugate_adjoints() {
+    let crow = indices(&[0, 2, 2, 3, 4], &[5]);
+    let columns = indices(&[1, 0, 2, 1], &[4]);
+    // Independent dense-matrix products and adjoints. Row 0 stores column 1
+    // before column 0; row 1 is empty and has nonzero loss weights. The VJP is
+    // G * conj(B) for stored values and conj(A)^T * G for the dense operand.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::Complex64, DType::Complex128] {
+            for (value_grad, dense_grad) in [(true, true), (true, false), (false, true)] {
+                let mut session = FrankenTorchSession::new(mode);
+                let values = complex_tensor(
+                    &mut session,
+                    &[(3., -1.), (2., 0.5), (4., -2.), (-1., 0.25)],
+                    &[4],
+                    dtype,
+                    value_grad,
+                );
+                let dense = complex_tensor(
+                    &mut session,
+                    &[
+                        (1., 1.),
+                        (2., -1.),
+                        (3., 0.5),
+                        (5., 2.),
+                        (7., -1.),
+                        (11., 0.25),
+                    ],
+                    &[3, 2],
+                    dtype,
+                    dense_grad,
+                );
+                let output = session
+                    .tensor_sparse_csr_mm(&crow, &columns, values, [4, 3], dense)
+                    .unwrap();
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                assert_eq!(session.tensor_shape(output).unwrap(), [4, 2]);
+                let real = session.tensor_real(output).unwrap();
+                let imag = session.tensor_imag(output).unwrap();
+                close(
+                    &session.tensor_values_lossy_f64(real).unwrap(),
+                    &[11., 21.5, 0., 0., 26., 44.5, -3.125, -5.5],
+                    0.,
+                );
+                close(
+                    &session.tensor_values_lossy_f64(imag).unwrap(),
+                    &[1., 0., 0., 0., -18., -21., 0.25, -0.75],
+                    0.,
+                );
+                let real_loss =
+                    weighted_loss(&mut session, real, &[1., -2., 3., 4., -1., 0.5, 2., 3.]);
+                let imag_loss =
+                    weighted_loss(&mut session, imag, &[2., 1., -1., 3., 2., -0.5, -0.25, 1.5]);
+                let loss = session.tensor_add(real_loss, imag_loss).unwrap();
+                close(
+                    &session.tensor_values_lossy_f64(loss).unwrap(),
+                    &[-83.1875],
+                    0.,
+                );
+                let report = session.tensor_backward(loss).unwrap();
+                if value_grad {
+                    close(
+                        report.gradient(values).unwrap(),
+                        &[-4., 14.5, -2., 1., -3.625, 7.375, 23.875, -0.25],
+                        0.,
+                    );
+                } else {
+                    assert!(report.gradient(values).is_none());
+                }
+                if dense_grad {
+                    close(
+                        report.gradient(dense).unwrap(),
+                        &[
+                            3., 3.5, -3.5, 3., -1.0625, 6.75, -9.625, -1.25, -8., 6., 3., -1.,
+                        ],
+                        0.,
+                    );
+                } else {
+                    assert!(report.gradient(dense).is_none());
+                }
+            }
+        }
+    }
 }
 
 #[test]

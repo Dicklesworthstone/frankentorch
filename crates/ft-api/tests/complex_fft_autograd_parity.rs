@@ -1609,7 +1609,6 @@ fn complex_narrow_vjp_preserves_both_lanes_on_every_axis() {
     }
 }
 
-
 fn real_strided_leaf(
     session: &mut FrankenTorchSession,
     dtype: DType,
@@ -1705,8 +1704,7 @@ fn complex_components_read_offset_views_and_route_weighted_gradients() {
                         &session.tensor_values_lossy_f64(output).unwrap(),
                         &expected,
                     );
-                    let weights: Vec<_> =
-                        (1..=expected.len()).map(|value| value as f64).collect();
+                    let weights: Vec<_> = (1..=expected.len()).map(|value| value as f64).collect();
                     let gradients = session
                         .tensor_autograd_grad(
                             &[output],
@@ -1730,8 +1728,16 @@ fn complex_components_read_offset_views_and_route_weighted_gradients() {
                             }
                         }
                     }
-                    assert_close("offset real VJP", gradients[0].as_ref().unwrap(), &expected_re);
-                    assert_close("offset imaginary VJP", gradients[1].as_ref().unwrap(), &expected_im);
+                    assert_close(
+                        "offset real VJP",
+                        gradients[0].as_ref().unwrap(),
+                        &expected_re,
+                    );
+                    assert_close(
+                        "offset imaginary VJP",
+                        gradients[1].as_ref().unwrap(),
+                        &expected_im,
+                    );
                     let after = session.tensor_snapshot(z).unwrap();
                     assert_eq!(after.meta(), source.meta());
                     assert_eq!(
@@ -1783,8 +1789,16 @@ fn complex_assembly_reads_independent_strides_offsets_and_preserves_vjps() {
                     false,
                 )
                 .unwrap();
-            assert_close("strided real VJP", gradients[0].as_ref().unwrap(), &[1.0, 3.0, 5.0, 7.0]);
-            assert_close("strided imaginary VJP", gradients[1].as_ref().unwrap(), &[2.0, 4.0, 6.0, 8.0]);
+            assert_close(
+                "strided real VJP",
+                gradients[0].as_ref().unwrap(),
+                &[1.0, 3.0, 5.0, 7.0],
+            );
+            assert_close(
+                "strided imaginary VJP",
+                gradients[1].as_ref().unwrap(),
+                &[2.0, 4.0, 6.0, 8.0],
+            );
         }
     }
 }
@@ -1796,7 +1810,13 @@ fn complex_view_roundtrip_reads_legal_strides_and_rejects_invalid_layouts_atomic
             let mut session = FrankenTorchSession::new(mode);
             let values: Vec<_> = (0..16).map(|value| value as f64).collect();
             let input = real_strided_leaf(
-                &mut session, dtype, &values, &[2, 2, 2], &[8, 2, 1], 2, true,
+                &mut session,
+                dtype,
+                &values,
+                &[2, 2, 2],
+                &[8, 2, 1],
+                2,
+                true,
             );
             let complex = session.tensor_view_as_complex(input).unwrap();
             let output = session.tensor_view_as_real(complex).unwrap();
@@ -1807,18 +1827,22 @@ fn complex_view_roundtrip_reads_legal_strides_and_rejects_invalid_layouts_atomic
             );
             let weights = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
             let gradients = session
-                .tensor_autograd_grad(
-                    &[output],
-                    &[input],
-                    Some(&[weights.clone()]),
-                    false,
-                    false,
-                )
+                .tensor_autograd_grad(&[output], &[input], Some(&[weights.clone()]), false, false)
                 .unwrap();
-            assert_close("strided view roundtrip VJP", gradients[0].as_ref().unwrap(), &weights);
+            assert_close(
+                "strided view roundtrip VJP",
+                gradients[0].as_ref().unwrap(),
+                &weights,
+            );
             for (strides, offset) in [([2, 1], 1), ([3, 1], 0), ([4, 2], 0)] {
                 let input = real_strided_leaf(
-                    &mut session, dtype, &values, &[2, 2], &strides, offset, true,
+                    &mut session,
+                    dtype,
+                    &values,
+                    &[2, 2],
+                    &strides,
+                    offset,
+                    true,
                 );
                 let before = session.autograd_graph_node_count();
                 assert!(session.tensor_view_as_complex(input).is_err());
@@ -1849,14 +1873,27 @@ fn contiguous_materializes_strides_with_real_first_and_second_derivatives() {
             assert!(session.tensor_is_contiguous(output).unwrap());
             assert_eq!(session.tensor_contiguous(output).unwrap(), output);
             assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
-            assert_eq!(session.tensor_snapshot(output).unwrap().meta().storage_offset(), 0);
+            assert_eq!(
+                session
+                    .tensor_snapshot(output)
+                    .unwrap()
+                    .meta()
+                    .storage_offset(),
+                0
+            );
             assert_close(
                 "contiguous logical values",
                 &session.tensor_values_lossy_f64(output).unwrap(),
                 &[1.0, 2.0, 4.0, 5.0],
             );
             let weights = real_strided_leaf(
-                &mut session, dtype, &[0.5, 1.0, 1.5, 2.0], &[2, 2], &[2, 1], 0, false,
+                &mut session,
+                dtype,
+                &[0.5, 1.0, 1.5, 2.0],
+                &[2, 2],
+                &[2, 1],
+                0,
+                false,
             );
             let square = session.tensor_mul(output, output).unwrap();
             let weighted = session.tensor_mul(square, weights).unwrap();
@@ -1867,11 +1904,19 @@ fn contiguous_materializes_strides_with_real_first_and_second_derivatives() {
                     BackwardOptions::for_mode(mode).with_create_graph(true),
                 )
                 .unwrap();
-            assert_close("contiguous first derivative", report.gradient(input).unwrap(), &[1.0, 4.0, 12.0, 20.0]);
+            assert_close(
+                "contiguous first derivative",
+                report.gradient(input).unwrap(),
+                &[1.0, 4.0, 12.0, 20.0],
+            );
             let gradient = report.gradient_node(input).unwrap();
             let gradient_sum = session.tensor_sum(gradient).unwrap();
             let second = session.tensor_backward(gradient_sum).unwrap();
-            assert_close("contiguous second derivative", second.gradient(input).unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+            assert_close(
+                "contiguous second derivative",
+                second.gradient(input).unwrap(),
+                &[1.0, 2.0, 3.0, 4.0],
+            );
 
             let detached = session
                 .with_no_grad(|session| session.tensor_contiguous(input))
@@ -1882,7 +1927,14 @@ fn contiguous_materializes_strides_with_real_first_and_second_derivatives() {
                 .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
                 .unwrap();
             let offset = session.tensor_narrow(base, 0, 1, 2).unwrap();
-            assert_eq!(session.tensor_snapshot(offset).unwrap().meta().storage_offset(), 1);
+            assert_eq!(
+                session
+                    .tensor_snapshot(offset)
+                    .unwrap()
+                    .meta()
+                    .storage_offset(),
+                1
+            );
             assert_eq!(session.tensor_contiguous(offset).unwrap(), offset);
         }
     }
@@ -1892,9 +1944,18 @@ fn scalar_storage_bits(storage: &TensorStorage) -> Vec<u64> {
     match storage {
         TensorStorage::F64(values) => values.iter().map(|value| value.to_bits()).collect(),
         TensorStorage::F64Inline4(values) => values.iter().map(|value| value.to_bits()).collect(),
-        TensorStorage::F32(values) => values.iter().map(|value| u64::from(value.to_bits())).collect(),
-        TensorStorage::F16(values) => values.iter().map(|value| u64::from(value.to_bits())).collect(),
-        TensorStorage::BF16(values) => values.iter().map(|value| u64::from(value.to_bits())).collect(),
+        TensorStorage::F32(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
+        TensorStorage::F16(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
+        TensorStorage::BF16(values) => values
+            .iter()
+            .map(|value| u64::from(value.to_bits()))
+            .collect(),
         TensorStorage::Complex64(values) => values
             .iter()
             .flat_map(|value| [u64::from(value.re.to_bits()), u64::from(value.im.to_bits())])
@@ -1909,28 +1970,58 @@ fn scalar_storage_bits(storage: &TensorStorage) -> Vec<u64> {
 
 #[test]
 fn contiguous_and_complex_components_preserve_nonfinite_bits_device_and_no_grad() {
-    let real32 = vec![91.0, -0.0, 91.0, f32::from_bits(0x7fc0_1234), 91.0, f32::NEG_INFINITY, 91.0];
-    let real64 = vec![91.0, -0.0, 91.0, f64::from_bits(0x7ff8_0000_0000_1234), 91.0, f64::NEG_INFINITY, 91.0];
+    let real32 = vec![
+        91.0,
+        -0.0,
+        91.0,
+        f32::from_bits(0x7fc0_1234),
+        91.0,
+        f32::NEG_INFINITY,
+        91.0,
+    ];
+    let real64 = vec![
+        91.0,
+        -0.0,
+        91.0,
+        f64::from_bits(0x7ff8_0000_0000_1234),
+        91.0,
+        f64::NEG_INFINITY,
+        91.0,
+    ];
     let storages = [
         TensorStorage::F32(Arc::new(real32.clone())),
         TensorStorage::F64(Arc::new(real64.clone())),
         TensorStorage::F16(Arc::new(vec![
-            Float16::from_f32(91.0), Float16::from_bits(0x8000),
-            Float16::from_f32(91.0), Float16::from_bits(0x7e15),
-            Float16::from_f32(91.0), Float16::from_bits(0xfc00),
+            Float16::from_f32(91.0),
+            Float16::from_bits(0x8000),
+            Float16::from_f32(91.0),
+            Float16::from_bits(0x7e15),
+            Float16::from_f32(91.0),
+            Float16::from_bits(0xfc00),
             Float16::from_f32(91.0),
         ])),
         TensorStorage::BF16(Arc::new(vec![
-            BFloat16::from_f32(91.0), BFloat16::from_bits(0x8000),
-            BFloat16::from_f32(91.0), BFloat16::from_bits(0x7fc5),
-            BFloat16::from_f32(91.0), BFloat16::from_bits(0xff80),
+            BFloat16::from_f32(91.0),
+            BFloat16::from_bits(0x8000),
+            BFloat16::from_f32(91.0),
+            BFloat16::from_bits(0x7fc5),
+            BFloat16::from_f32(91.0),
+            BFloat16::from_bits(0xff80),
             BFloat16::from_f32(91.0),
         ])),
         TensorStorage::Complex64(Arc::new(
-            real32.iter().enumerate().map(|(i, &re)| Complex64::new(re, real32[6 - i])).collect(),
+            real32
+                .iter()
+                .enumerate()
+                .map(|(i, &re)| Complex64::new(re, real32[6 - i]))
+                .collect(),
         )),
         TensorStorage::Complex128(Arc::new(
-            real64.iter().enumerate().map(|(i, &re)| Complex128::new(re, real64[6 - i])).collect(),
+            real64
+                .iter()
+                .enumerate()
+                .map(|(i, &re)| Complex128::new(re, real64[6 - i]))
+                .collect(),
         )),
     ];
     for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
@@ -1941,12 +2032,15 @@ fn contiguous_and_complex_components_preserve_nonfinite_bits_device_and_no_grad(
             let source_bits = scalar_storage_bits(storage);
             let expected: Vec<_> = [1, 3, 5]
                 .into_iter()
-                .flat_map(|index| source_bits[index * lanes..(index + 1) * lanes].iter().copied())
+                .flat_map(|index| {
+                    source_bits[index * lanes..(index + 1) * lanes]
+                        .iter()
+                        .copied()
+                })
                 .collect();
-            let meta = TensorMeta::from_shape_and_strides(
-                vec![3], vec![2], 1, dtype, Device::Metal,
-            )
-            .unwrap();
+            let meta =
+                TensorMeta::from_shape_and_strides(vec![3], vec![2], 1, dtype, Device::Metal)
+                    .unwrap();
             let input = session.tensor_variable_from_storage(
                 DenseTensor::from_typed_storage(meta, storage.clone()).unwrap(),
                 true,
@@ -1972,9 +2066,17 @@ fn contiguous_and_complex_components_preserve_nonfinite_bits_device_and_no_grad(
                     let expected_component: Vec<_> = if operation == 2 {
                         expected.clone()
                     } else {
-                        expected.iter().skip(operation).step_by(2).copied().collect()
+                        expected
+                            .iter()
+                            .skip(operation)
+                            .step_by(2)
+                            .copied()
+                            .collect()
                     };
-                    assert_eq!(scalar_storage_bits(tensor.typed_storage()), expected_component);
+                    assert_eq!(
+                        scalar_storage_bits(tensor.typed_storage()),
+                        expected_component
+                    );
                     assert_eq!(tensor.meta().device(), Device::Metal);
                     assert!(!session.tensor_requires_grad(output).unwrap());
                 }
@@ -2025,25 +2127,33 @@ fn complex_bridges_handle_scalar_and_empty_logical_views() {
     for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
         for dtype in [DType::F32, DType::F64] {
             let mut session = FrankenTorchSession::new(mode);
-            let re = real_strided_leaf(
-                &mut session, dtype, &[1.0, 2.0, 3.0], &[], &[], 1, true,
-            );
-            let im = real_strided_leaf(
-                &mut session, dtype, &[1.0, 2.0, 3.0], &[], &[], 2, true,
-            );
+            let re = real_strided_leaf(&mut session, dtype, &[1.0, 2.0, 3.0], &[], &[], 1, true);
+            let im = real_strided_leaf(&mut session, dtype, &[1.0, 2.0, 3.0], &[], &[], 2, true);
             let z = session.tensor_complex(re, im).unwrap();
             let output = session.tensor_view_as_real(z).unwrap();
-            assert_close("scalar complex components", &session.tensor_values_lossy_f64(output).unwrap(), &[2.0, 3.0]);
+            assert_close(
+                "scalar complex components",
+                &session.tensor_values_lossy_f64(output).unwrap(),
+                &[2.0, 3.0],
+            );
             let gradients = session
-                .tensor_autograd_grad(
-                    &[output], &[re, im], Some(&[vec![4.0, 5.0]]), false, false,
-                )
+                .tensor_autograd_grad(&[output], &[re, im], Some(&[vec![4.0, 5.0]]), false, false)
                 .unwrap();
             assert_close("scalar real VJP", gradients[0].as_ref().unwrap(), &[4.0]);
-            assert_close("scalar imaginary VJP", gradients[1].as_ref().unwrap(), &[5.0]);
+            assert_close(
+                "scalar imaginary VJP",
+                gradients[1].as_ref().unwrap(),
+                &[5.0],
+            );
 
             let empty = real_strided_leaf(
-                &mut session, dtype, &[1.0, 2.0, 3.0], &[0, 2], &[8, 1], 2, true,
+                &mut session,
+                dtype,
+                &[1.0, 2.0, 3.0],
+                &[0, 2],
+                &[8, 1],
+                2,
+                true,
             );
             assert!(session.tensor_is_contiguous(empty).unwrap());
             assert_eq!(session.tensor_contiguous(empty).unwrap(), empty);
@@ -2097,7 +2207,11 @@ fn strided_float_casts_and_custom_functions_keep_logical_values_and_vjps() {
                         false,
                     )
                     .unwrap();
-                assert_close("strided cast VJP", gradients[0].as_ref().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+                assert_close(
+                    "strided cast VJP",
+                    gradients[0].as_ref().unwrap(),
+                    &[1.0, 2.0, 3.0, 4.0],
+                );
             }
             let mut session = FrankenTorchSession::new(mode);
             let input = real_strided_leaf(
@@ -2114,7 +2228,10 @@ fn strided_float_casts_and_custom_functions_keep_logical_values_and_vjps() {
                     &[input],
                     |ctx, inputs| {
                         ctx.save_for_backward(inputs[0].0.to_vec(), inputs[0].1.to_vec());
-                        Ok((inputs[0].0.iter().map(|value| value * value).collect(), inputs[0].1.to_vec()))
+                        Ok((
+                            inputs[0].0.iter().map(|value| value * value).collect(),
+                            inputs[0].1.to_vec(),
+                        ))
                     },
                     |ctx, gradients| {
                         Ok(vec![Some(
@@ -2141,7 +2258,11 @@ fn strided_float_casts_and_custom_functions_keep_logical_values_and_vjps() {
                     false,
                 )
                 .unwrap();
-            assert_close("strided custom VJP", gradients[0].as_ref().unwrap(), &[2.0, 8.0, 24.0, 40.0]);
+            assert_close(
+                "strided custom VJP",
+                gradients[0].as_ref().unwrap(),
+                &[2.0, 8.0, 24.0, 40.0],
+            );
         }
     }
 }

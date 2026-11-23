@@ -1268,11 +1268,32 @@ fn checked_shape_numel(shape: &[usize]) -> Result<usize, DenseTensorError> {
     Ok(product)
 }
 
+/// A logical view can be much larger than its backing storage. Check both
+/// element arithmetic and Vec's byte-capacity bound before materializing it.
+fn checked_allocation_numel(
+    shape: &[usize],
+    element_size: usize,
+) -> Result<usize, DenseTensorError> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    let numel = checked_shape_numel(shape)?;
+    if numel
+        .checked_mul(element_size)
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(DenseTensorError::ShapeOverflow {
+            shape: shape.to_vec(),
+        });
+    }
+    Ok(numel)
+}
+
 fn gather_logical_storage<T: Copy>(
     meta: &TensorMeta,
     storage: &[T],
 ) -> Result<Vec<T>, DenseTensorError> {
-    let numel = meta.numel();
+    let numel = checked_allocation_numel(meta.shape(), meta.dtype().element_size())?;
     if numel == 0 {
         return Ok(Vec::new());
     }
@@ -2834,12 +2855,12 @@ fn sparse_values_to_dense(
     destinations: &[usize],
     coalesced: bool,
 ) -> Result<DenseTensor, SparseTensorError> {
-    let numel = checked_shape_numel(&shape)?;
     let meta = values.meta();
+    let numel = checked_allocation_numel(&shape, meta.dtype().element_size())?;
     let block_width = if destinations.is_empty() {
         0
     } else {
-        checked_shape_numel(&meta.shape()[1..])?
+        checked_allocation_numel(&meta.shape()[1..], std::mem::size_of::<usize>())?
     };
     let block_offsets: Vec<_> = (0..block_width)
         .map(|mut linear| {
@@ -3200,7 +3221,8 @@ impl SparseCOOTensor {
     /// value strides and offsets are honored, including hybrid dense blocks.
     /// Coalesced values are copied without arithmetic to preserve their bits.
     pub fn to_dense(&self) -> Result<DenseTensor, SparseTensorError> {
-        checked_shape_numel(&self.dense_shape)?;
+        checked_allocation_numel(&self.dense_shape, self.dtype().element_size())?;
+        checked_allocation_numel(&[self.nnz()], std::mem::size_of::<usize>())?;
         let indices = self.indices.contiguous_values()?;
         let strides = contiguous_strides(&self.dense_shape);
         let destinations: Vec<_> = (0..self.nnz())
@@ -3462,7 +3484,8 @@ impl SparseCSRTensor {
     /// Adds logical values into zero in their storage dtype, honoring strided
     /// and offset value views without converting through F64.
     pub fn to_dense(&self) -> Result<DenseTensor, SparseTensorError> {
-        checked_shape_numel(&self.shape)?;
+        checked_allocation_numel(&self.shape, self.dtype().element_size())?;
+        checked_allocation_numel(&[self.nnz()], std::mem::size_of::<usize>())?;
         let crow = self.crow_indices.contiguous_values()?;
         let columns = self.col_indices.contiguous_values()?;
         let mut destinations = Vec::with_capacity(self.nnz());
@@ -4116,6 +4139,102 @@ mod tests {
         assert!(matches!(
             err,
             SparseTensorError::DenseTensor(DenseTensorError::ShapeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_to_dense_rejects_byte_capacity_overflow_with_empty_storage() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+        ] {
+            for columns in [isize::MAX as usize / dtype.element_size() + 1, usize::MAX] {
+                let shape = vec![1, columns];
+                let coo =
+                    SparseCOOTensor::from_coords(&[], vec![], shape.clone(), dtype, Device::Cpu)
+                        .unwrap();
+                let csr = SparseCSRTensor::new(
+                    DenseI64Tensor::from_contiguous_values(vec![0, 0], vec![2], Device::Cpu)
+                        .unwrap(),
+                    DenseI64Tensor::from_contiguous_values(vec![], vec![0], Device::Cpu).unwrap(),
+                    coo.values().clone(),
+                    [1, columns],
+                )
+                .unwrap();
+                // Only empty value/index storage and two row pointers exist;
+                // densification must reject both byte overflow cases as errors.
+                for result in [coo.to_dense(), csr.to_dense()] {
+                    assert!(matches!(
+                        result,
+                        Err(SparseTensorError::DenseTensor(DenseTensorError::ShapeOverflow {
+                            shape: rejected,
+                        })) if rejected == shape
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_to_dense_rejects_oversized_logical_index_temporaries() {
+        let count = isize::MAX as usize / std::mem::size_of::<usize>() + 1;
+        // Zero sparse dimensions permit many scalar entries with no coordinate
+        // storage. Their broadcast values fit in one element, but the temporary
+        // destination vector cannot be represented.
+        let scalar = SparseCOOTensor::new(
+            DenseI64Tensor::from_contiguous_values(vec![], vec![0, count], Device::Cpu).unwrap(),
+            DenseTensor::from_storage_f32(
+                TensorMeta::from_shape_and_strides(
+                    vec![count],
+                    vec![0],
+                    0,
+                    DType::F32,
+                    Device::Cpu,
+                )
+                .unwrap(),
+                vec![1.0],
+            )
+            .unwrap(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            scalar.to_dense(),
+            Err(SparseTensorError::DenseTensor(
+                DenseTensorError::ShapeOverflow { .. }
+            ))
+        ));
+
+        // A single F16 dense block fits the output's two-byte element bound but
+        // cannot allocate one usize offset for each broadcast block element.
+        let block = SparseCOOTensor::new(
+            DenseI64Tensor::from_contiguous_values(vec![0], vec![1, 1], Device::Cpu).unwrap(),
+            DenseTensor::from_storage_f16(
+                TensorMeta::from_shape_and_strides(
+                    vec![1, count],
+                    vec![0, 0],
+                    0,
+                    DType::F16,
+                    Device::Cpu,
+                )
+                .unwrap(),
+                vec![Float16::ONE],
+            )
+            .unwrap(),
+            vec![1, count],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            block.to_dense(),
+            Err(SparseTensorError::DenseTensor(
+                DenseTensorError::ShapeOverflow { .. }
+            ))
         ));
     }
 
@@ -6078,6 +6197,71 @@ mod tests {
             TensorMeta::from_shape_and_strides(vec![0, 3], vec![1], 0, DType::F32, Device::Cpu,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn to_contiguous_rejects_byte_capacity_overflow_in_broadcast_views() {
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Complex64,
+            DType::Complex128,
+            DType::QInt8,
+            DType::QUInt8,
+        ] {
+            let storage = match dtype {
+                DType::QInt8 => TensorStorage::QInt8(Arc::new(vec![1])),
+                DType::QUInt8 => TensorStorage::QUInt8(Arc::new(vec![1])),
+                _ => DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .typed_storage()
+                    .clone(),
+            };
+            for count in [isize::MAX as usize / dtype.element_size() + 1, usize::MAX] {
+                let meta = if dtype.is_quantized() {
+                    TensorMeta::quantized_from_shape_and_strides(
+                        vec![count],
+                        vec![0],
+                        0,
+                        dtype,
+                        Device::Cpu,
+                        1.0,
+                        0,
+                    )
+                    .unwrap()
+                } else {
+                    TensorMeta::from_shape_and_strides(vec![count], vec![0], 0, dtype, Device::Cpu)
+                        .unwrap()
+                };
+                let broadcast = DenseTensor::from_typed_storage(meta, storage.clone()).unwrap();
+                assert_eq!(broadcast.typed_storage().len(), 1);
+                assert!(matches!(
+                    broadcast.to_contiguous(),
+                    Err(DenseTensorError::ShapeOverflow { shape }) if shape == vec![count]
+                ));
+            }
+        }
+        // An empty logical view allocates no elements even when a prefix of
+        // its dimensions would overflow. Padding forces the gather path.
+        let empty = DenseTensor::from_storage_f32(
+            TensorMeta::from_shape_and_strides(
+                vec![usize::MAX, usize::MAX, 0],
+                vec![0, 0, 0],
+                1,
+                DType::F32,
+                Device::Cpu,
+            )
+            .unwrap(),
+            vec![99.0],
+        )
+        .unwrap();
+        let packed = empty.to_contiguous().unwrap();
+        assert_eq!(packed.meta().shape(), empty.meta().shape());
+        assert!(packed.typed_storage().is_empty());
     }
 
     // ── Sparse Tensor Tests ────────────────────────────────────────────────
