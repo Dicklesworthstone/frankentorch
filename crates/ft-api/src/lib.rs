@@ -1858,8 +1858,10 @@ impl FrankenTorchSession {
         // The typed bridge accepts the exact forward tensor, including casts,
         // half precision, complex values, and device metadata. Generic
         // apply_function would instead choose the last input's dtype.
-        self.tensor_tape
-            .apply_complex_bridge(inputs, output_tensor, move |ctx, grad_outputs| {
+        let out = self.tensor_tape.apply_complex_bridge(
+            inputs,
+            output_tensor,
+            move |ctx, grad_outputs| {
                 let mut recomp_session = FrankenTorchSession::new(saved_mode);
                 recomp_session.rng = saved_rng.clone();
                 recomp_session.autocast_stack = saved_autocast.clone();
@@ -1926,7 +1928,13 @@ impl FrankenTorchSession {
                         }
                     })
                     .collect())
-            })
+            },
+        )?;
+        if self.tensor_requires_grad(out)? {
+            self.tensor_tape
+                .save_custom_function_input_versions(out, inputs)?;
+        }
+        Ok(out)
     }
 
     fn sync_grad_enabled(&mut self) {
@@ -174707,18 +174715,18 @@ mod tests {
                 s.tensor_add(product, inputs[2])
             })
             .unwrap();
-        let gradients = s
-            .tensor_autograd_grad(
+        let report = s
+            .tensor_autograd_grad_report(
                 &[out],
-                &[x, w, bias],
+                &[x, w],
                 Some(&[vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]),
                 false,
                 false,
             )
             .unwrap();
-        assert_eq!(gradients[0].as_deref(), Some(&[52.0, 121.0][..]));
-        assert_eq!(gradients[1].as_deref(), Some(&[14.0, 19.0, 24.0][..]));
-        assert!(gradients[2].is_none());
+        assert_eq!(report.gradient(x), Some(&[52.0, 121.0][..]));
+        assert_eq!(report.gradient(w), Some(&[14.0, 19.0, 24.0][..]));
+        assert!(report.gradient(bias).is_none());
     }
 
     #[test]

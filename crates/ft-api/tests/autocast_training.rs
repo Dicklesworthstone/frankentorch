@@ -651,18 +651,49 @@ fn checkpoint_broadcast_keeps_frozen_inputs_frozen() {
             s.tensor_add(product, inputs[2])
         })
         .unwrap();
-    let gradients = s
-        .tensor_autograd_grad(
+    let report = s
+        .tensor_autograd_grad_report(
             &[out],
-            &[x, w, bias],
+            &[x, w],
             Some(&[vec![1., 2., 3., 4., 5., 6.]]),
             false,
             false,
         )
         .unwrap();
-    assert_eq!(gradients[0].as_deref(), Some(&[52., 121.][..]));
-    assert_eq!(gradients[1].as_deref(), Some(&[14., 19., 24.][..]));
-    assert!(gradients[2].is_none());
+    assert_eq!(report.gradient(x), Some(&[52., 121.][..]));
+    assert_eq!(report.gradient(w), Some(&[14., 19., 24.][..]));
+    assert!(report.gradient(bias).is_none());
+}
+
+#[test]
+fn checkpoint_rejects_replay_after_trainable_or_frozen_input_changes() {
+    use ft_autograd::AutogradError;
+    use ft_core::{DenseTensor, Device};
+
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for change_frozen in [false, true] {
+            let mut s = FrankenTorchSession::new(mode);
+            let x = s.tensor_variable(vec![2., 3.], vec![2], true).unwrap();
+            let w = s.tensor_variable(vec![5., 7.], vec![2], false).unwrap();
+            let loss = s
+                .checkpoint(&[x, w], |s, inputs| {
+                    let product = s.tensor_mul(inputs[0], inputs[1])?;
+                    s.tensor_sum(product)
+                })
+                .unwrap();
+            let changed = if change_frozen { w } else { x };
+            let recorded = s.tensor_snapshot(changed).unwrap().version();
+            let new_value =
+                DenseTensor::from_contiguous_values(vec![11., 13.], vec![2], Device::Cpu).unwrap();
+            s.tensor_load_state(&[(changed, new_value)]).unwrap();
+            assert!(matches!(
+                s.tensor_backward(loss),
+                Err(AutogradError::BorrowedInputVersionMismatch {
+                    node, recorded: saved, observed,
+                }) if node == changed && saved == recorded && observed == recorded + 1
+            ));
+        }
+    }
 }
 
 #[test]
