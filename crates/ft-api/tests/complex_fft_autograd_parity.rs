@@ -2421,13 +2421,7 @@ fn complex_phase_values_and_weighted_gradients_match_independent_goldens() {
                     tolerance,
                 );
                 let gradients = session
-                    .tensor_autograd_grad(
-                        &[output],
-                        &[input],
-                        Some(&[seed.to_vec()]),
-                        false,
-                        false,
-                    )
+                    .tensor_autograd_grad(&[output], &[input], Some(&[seed.to_vec()]), false, false)
                     .unwrap();
                 assert_fft_close(
                     "phase VJP",
@@ -2687,13 +2681,8 @@ fn complex_phase_masks_origin_gradients_even_for_nonfinite_seeds() {
         for unit_sign in [false, true] {
             for seed in [0.0, 1.0, f64::INFINITY, f64::NAN] {
                 let mut session = s();
-                let input = phase_input(
-                    &mut session,
-                    dtype,
-                    &[(0.0, 0.0), (-0.0, -0.0)],
-                    &[2],
-                    true,
-                );
+                let input =
+                    phase_input(&mut session, dtype, &[(0.0, 0.0), (-0.0, -0.0)], &[2], true);
                 let output = if unit_sign {
                     session.tensor_sgn(input)
                 } else {
@@ -2729,8 +2718,7 @@ fn complex_phase_checks_saved_input_versions_and_rejects_higher_orders() {
                     session.tensor_angle(input)
                 }
                 .unwrap();
-                let replacement =
-                    phase_input(&mut session, dtype, &[(5.0, 12.0)], &[1], false);
+                let replacement = phase_input(&mut session, dtype, &[(5.0, 12.0)], &[1], false);
                 session
                     .tensor_load_state(&[(input, session.tensor_snapshot(replacement).unwrap())])
                     .unwrap();
@@ -2848,9 +2836,11 @@ fn complex_phase_preserves_signed_zero_and_stable_nonfinite_semantics() {
                 false,
             )
             .unwrap();
-        assert!(gradients[0].as_ref().unwrap()[12..]
-            .iter()
-            .all(|value| value.is_nan()));
+        assert!(
+            gradients[0].as_ref().unwrap()[12..]
+                .iter()
+                .all(|value| value.is_nan())
+        );
     }
 }
 
@@ -2872,8 +2862,7 @@ fn complex_phase_losses_train_through_fft_against_independent_dft_differences() 
                     }
                     let phase = imag.atan2(real);
                     if unit_sign {
-                        seed[2 * frequency] * phase.cos()
-                            + seed[2 * frequency + 1] * phase.sin()
+                        seed[2 * frequency] * phase.cos() + seed[2 * frequency + 1] * phase.sin()
                     } else {
                         seed[frequency] * phase
                     }
@@ -2890,7 +2879,9 @@ fn complex_phase_losses_train_through_fft_against_independent_dft_differences() 
             })
             .collect();
         let mut session = s();
-        let input = session.tensor_variable(values.to_vec(), vec![4], true).unwrap();
+        let input = session
+            .tensor_variable(values.to_vec(), vec![4], true)
+            .unwrap();
         let spectrum = session.tensor_fft(input, None).unwrap();
         let output = if unit_sign {
             session.tensor_sgn(spectrum)
@@ -2971,7 +2962,9 @@ fn complex_abs_reads_logical_views_and_guards_the_original_input() {
                     &[5.0, 13.0, 17.0, 0.0],
                     0.0,
                 );
-                let no_grad = session.with_no_grad(|session| session.tensor_abs(input)).unwrap();
+                let no_grad = session
+                    .with_no_grad(|session| session.tensor_abs(input))
+                    .unwrap();
                 assert!(!session.tensor_requires_grad(no_grad).unwrap());
                 assert_fft_close(
                     "no_grad strided magnitude",
@@ -2993,28 +2986,33 @@ fn complex_abs_reads_logical_views_and_guards_the_original_input() {
                     assert_fft_close(
                         "strided magnitude weighted VJP",
                         gradients[0].as_ref().unwrap(),
-                        &[1.2, 1.6, 15.0 / 13.0, -36.0 / 13.0, 4.0 / 17.0, -7.5 / 17.0, 0.0, 0.0],
-                        if dtype == DType::Complex64 { 3e-7 } else { 1e-12 },
+                        &[
+                            1.2,
+                            1.6,
+                            15.0 / 13.0,
+                            -36.0 / 13.0,
+                            4.0 / 17.0,
+                            -7.5 / 17.0,
+                            0.0,
+                            0.0,
+                        ],
+                        if dtype == DType::Complex64 {
+                            3e-7
+                        } else {
+                            1e-12
+                        },
                     );
                     let guarded = session.tensor_abs(input).unwrap();
-                    let replacement = phase_input(
-                        &mut session,
-                        dtype,
-                        &[(5.0, 12.0); 4],
-                        &[2, 2],
-                        false,
-                    );
+                    let replacement =
+                        phase_input(&mut session, dtype, &[(5.0, 12.0); 4], &[2, 2], false);
                     session
-                        .tensor_load_state(&[(input, session.tensor_snapshot(replacement).unwrap())])
+                        .tensor_load_state(&[(
+                            input,
+                            session.tensor_snapshot(replacement).unwrap(),
+                        )])
                         .unwrap();
                     let error = session
-                        .tensor_autograd_grad(
-                            &[guarded],
-                            &[input],
-                            Some(&[seed]),
-                            false,
-                            false,
-                        )
+                        .tensor_autograd_grad(&[guarded], &[input], Some(&[seed]), false, false)
                         .unwrap_err();
                     assert!(
                         matches!(error, AutogradError::BorrowedInputVersionMismatch { node, .. } if node == input)
@@ -3050,6 +3048,260 @@ fn complex_abs_vjp_preserves_nonfinite_seed_and_input_propagation() {
                 assert!(gradient[..2].iter().all(|value| value.is_nan()));
             }
             assert!(gradient[2..].iter().all(|value| value.is_nan()));
+        }
+    }
+}
+
+#[test]
+fn complex_abs_vjp_preserves_native_precision_at_overflow_and_underflow() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        let mut session = FrankenTorchSession::new(mode);
+        let input = phase_input(
+            &mut session,
+            DType::Complex64,
+            &[
+                (f64::from(f32::MAX), f64::from(f32::MAX)),
+                (3.0, 4.0),
+                (1.0, 0.0),
+            ],
+            &[3],
+            true,
+        );
+        let magnitude = session.tensor_abs(input).unwrap();
+        let values = phase_values(&session, magnitude);
+        assert_eq!(values, vec![f64::INFINITY, 5.0, 1.0]);
+        let seed = vec![1.0, 3.0, f64::from(f32::from_bits(1)) * 0.25];
+        let gradient = session
+            .tensor_autograd_grad(&[magnitude], &[input], Some(&[seed]), false, false)
+            .unwrap();
+        // The overflowed f32 norm makes sgn(max + max*i) exactly zero.
+        // The middle pair locks the native round after sign and multiplication;
+        // the last cotangent rounds to zero in the output's F32 dtype.
+        let expected = [
+            0.0,
+            0.0,
+            f64::from(f32::from_bits(0x3fe6_6667)),
+            f64::from(f32::from_bits(0x4019_999a)),
+            0.0,
+            0.0,
+        ];
+        assert_fft_close(
+            "native Complex64 abs VJP",
+            gradient[0].as_ref().unwrap(),
+            &expected,
+            0.0,
+        );
+    }
+}
+
+#[test]
+fn complex_abs_vjp_propagates_both_lanes_of_isolated_infinities() {
+    for dtype in [DType::Complex64, DType::Complex128] {
+        let mut session = s();
+        let input = phase_input(
+            &mut session,
+            dtype,
+            &[(f64::INFINITY, 1.0), (1.0, f64::NEG_INFINITY)],
+            &[2],
+            true,
+        );
+        let magnitude = session.tensor_abs(input).unwrap();
+        let gradient = session
+            .tensor_autograd_grad(&[magnitude], &[input], Some(&[vec![1.0; 2]]), false, false)
+            .unwrap();
+        assert!(
+            gradient[0]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_nan())
+        );
+    }
+}
+
+#[test]
+fn real_angle_preserves_logical_layout_dtype_and_zero_gradients() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            for requires_grad in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                let input = real_strided_leaf(
+                    &mut session,
+                    dtype,
+                    &[7.0, -2.0, -0.0, 7.0, f64::INFINITY, f64::NAN, 7.0],
+                    &[2, 2],
+                    &[3, 1],
+                    1,
+                    requires_grad,
+                );
+                let output = session.tensor_angle(input).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), vec![2, 2]);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                assert_eq!(session.tensor_requires_grad(output).unwrap(), requires_grad);
+                let expected_pi = match dtype {
+                    DType::F64 => std::f64::consts::PI,
+                    DType::F32 => f64::from(std::f32::consts::PI),
+                    DType::F16 => f64::from(Float16::from_f32(std::f32::consts::PI).to_f32()),
+                    DType::BF16 => f64::from(BFloat16::from_f32(std::f32::consts::PI).to_f32()),
+                    _ => unreachable!(),
+                };
+                let values = session.tensor_values_lossy_f64(output).unwrap();
+                assert_eq!(values[0], expected_pi);
+                assert_eq!(values[1].to_bits(), 0.0_f64.to_bits());
+                assert_eq!(values[2].to_bits(), 0.0_f64.to_bits());
+                assert!(values[3].is_nan());
+                let no_grad = session
+                    .with_no_grad(|session| session.tensor_angle(input))
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(no_grad).unwrap());
+                assert_eq!(session.tensor_dtype(no_grad).unwrap(), dtype);
+                let no_grad_values = session.tensor_values_lossy_f64(no_grad).unwrap();
+                assert_eq!(&no_grad_values[..3], &values[..3]);
+                assert!(no_grad_values[3].is_nan());
+                if requires_grad {
+                    let seed = vec![f64::NEG_INFINITY, f64::NAN, f64::INFINITY, -4.0];
+                    let gradient = session
+                        .tensor_autograd_grad(&[output], &[input], Some(&[seed]), false, false)
+                        .unwrap();
+                    assert_eq!(gradient[0].as_ref().unwrap(), &[0.0; 4]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn real_angle_preserves_scalar_empty_and_device_metadata() {
+    for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+        for shape in [vec![], vec![2, 0, 3]] {
+            let mut session = s();
+            let (values, strides, offset) = if shape.is_empty() {
+                (vec![f64::NAN, -2.0], vec![], 1)
+            } else {
+                (Vec::new(), vec![0, 3, 1], 0)
+            };
+            let input =
+                real_strided_leaf(&mut session, dtype, &values, &shape, &strides, offset, true);
+            let output = session.tensor_angle(input).unwrap();
+            assert_eq!(session.tensor_shape(output).unwrap(), shape);
+            assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+            let count = usize::from(shape.is_empty());
+            let gradient = session
+                .tensor_autograd_grad(
+                    &[output],
+                    &[input],
+                    Some(&[vec![f64::NAN; count]]),
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(gradient[0].as_ref().unwrap(), &vec![0.0; count]);
+
+            let snapshot = session.tensor_snapshot(input).unwrap();
+            let meta = TensorMeta::from_shape_and_strides(
+                shape.clone(),
+                strides,
+                offset,
+                dtype,
+                Device::Metal,
+            )
+            .unwrap();
+            let relocated = session.tensor_variable_from_storage(
+                DenseTensor::from_typed_storage(meta, snapshot.typed_storage().clone()).unwrap(),
+                false,
+            );
+            let output = session.tensor_angle(relocated).unwrap();
+            assert_eq!(session.tensor_shape(output).unwrap(), shape);
+            assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+            assert_eq!(
+                session.tensor_snapshot(output).unwrap().meta().device(),
+                Device::Metal
+            );
+        }
+    }
+}
+
+#[test]
+fn real_angle_create_graph_keeps_other_loss_curvature() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32] {
+            let mut session = FrankenTorchSession::new(mode);
+            let input = real_strided_leaf(
+                &mut session,
+                dtype,
+                &[-2.0, -0.5, 0.25, 3.0],
+                &[2, 2],
+                &[1, 2],
+                0,
+                true,
+            );
+            let angle = session.tensor_angle(input).unwrap();
+            let square = session.tensor_mul(input, input).unwrap();
+            let loss = session.tensor_add(angle, square).unwrap();
+            let first = session
+                .tensor_autograd_grad_report(&[loss], &[input], Some(&[vec![1.0; 4]]), true, true)
+                .unwrap();
+            assert_eq!(first.gradient(input).unwrap(), &[-4.0, 0.5, -1.0, 6.0]);
+            let first_node = first.gradient_node(input).unwrap();
+            let second = session
+                .tensor_autograd_grad(
+                    &[first_node],
+                    &[input],
+                    Some(&[vec![1.0; 4]]),
+                    false,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(second[0].as_ref().unwrap(), &[2.0; 4]);
+        }
+    }
+}
+
+#[test]
+fn real_angle_create_graph_zero_is_detached_and_saved_input_is_guarded() {
+    for create_graph in [false, true] {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            let mut session = s();
+            let input =
+                real_strided_leaf(&mut session, dtype, &[f64::NAN, -2.0], &[2], &[1], 0, true);
+            let output = session.tensor_angle(input).unwrap();
+            let report = session
+                .tensor_autograd_grad_report(
+                    &[output],
+                    &[input],
+                    Some(&[vec![f64::NAN, f64::INFINITY]]),
+                    true,
+                    create_graph,
+                )
+                .unwrap();
+            assert_eq!(report.gradient(input).unwrap(), &[0.0; 2]);
+            if create_graph {
+                assert!(
+                    !session
+                        .tensor_requires_grad(report.gradient_node(input).unwrap())
+                        .unwrap()
+                );
+            }
+            let replacement =
+                real_strided_leaf(&mut session, dtype, &[3.0, 4.0], &[2], &[1], 0, false);
+            session
+                .tensor_load_state(&[(input, session.tensor_snapshot(replacement).unwrap())])
+                .unwrap();
+            let error = session
+                .tensor_autograd_grad(
+                    &[output],
+                    &[input],
+                    Some(&[vec![1.0; 2]]),
+                    false,
+                    create_graph,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, AutogradError::BorrowedInputVersionMismatch { node, .. } if node == input)
+            );
+            let before = session.autograd_graph_node_count();
+            assert!(session.tensor_angle(TensorNodeId(usize::MAX)).is_err());
+            assert_eq!(session.autograd_graph_node_count(), before);
         }
     }
 }

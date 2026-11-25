@@ -21,6 +21,36 @@ permissions:
   contents: read
 
 jobs:
+  training-semantics:
+    name: Focused training semantics
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Build the public API integration targets with bounded memory, without
+      # waiting for the workspace's hundreds of example binaries to link.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install repository Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-31
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: training-semantics
+
+      - name: Complex, phase, and typed training regressions
+        run: cargo test -j 1 -p frankentorch-api --test complex_fft_autograd_parity --test autocast_training
+
+      - name: BatchNorm training and checkpoint regressions
+        run: cargo test -j 1 -p ft-nn --lib batchnorm_
+
   gate-topology:
     name: G1..G8 gate topology
     runs-on: ubuntu-latest

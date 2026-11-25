@@ -20761,74 +20761,90 @@ impl FrankenTorchSession {
     }
 
     pub fn tensor_abs(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        // Complex |z| = hypot(re, im) -> real output (torch.abs(complex)); the
-        // unary dispatch rejects complex. The VJP is grad * sgn(z), including
-        // IEEE propagation for nonfinite seeds at the origin. frankentorch-ng1hw.
-        {
-            let dtype = self.tensor_tape.tensor(input)?.meta().dtype();
-            if matches!(dtype, DType::Complex64 | DType::Complex128) {
-                // Read logical values, preserving the original node as the
-                // bridge parent and saved-version guard for strided views.
-                let tensor = self.tensor_tape.compact_tensor(input)?;
-                let meta = tensor.meta().clone();
-                let requires_grad = self.tensor_tape.tensor_requires_grad(input)?
-                    && self.tensor_tape.is_grad_enabled();
-                // Capture re/im (f64) for the Wirtinger backward.
-                let (re_im, output_meta, output_storage): (Vec<(f64, f64)>, _, _) = match tensor
-                    .typed_storage()
-                {
-                    TensorStorage::Complex64(values) => (
-                        values
-                            .iter()
-                            .map(|z| (f64::from(z.re), f64::from(z.im)))
-                            .collect(),
-                        TensorMeta::from_shape(meta.shape().to_vec(), DType::F32, meta.device()),
-                        TensorStorage::F32(Arc::new(
-                            values.iter().map(|z| z.re.hypot(z.im)).collect(),
-                        )),
-                    ),
-                    TensorStorage::Complex128(values) => (
-                        values.iter().map(|z| (z.re, z.im)).collect(),
-                        TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
-                        TensorStorage::F64(Arc::new(
-                            values.iter().map(|z| z.re.hypot(z.im)).collect(),
-                        )),
-                    ),
-                    _ => unreachable!("dtype is complex"),
-                };
-                let output = DenseTensor::from_typed_storage(output_meta, output_storage)?;
-                let out = if requires_grad {
-                    let out = self.tensor_tape.apply_complex_bridge(
-                        &[input],
-                        output,
-                        move |_ctx, grad_outputs| {
-                            let g = grad_outputs[0];
-                            let mut grad_z = vec![0.0; g.len() * 2];
-                            for (i, &(re, im)) in re_im.iter().enumerate() {
-                                let mag = re.hypot(im);
-                                let (sign_re, sign_im) = if mag == 0.0 {
-                                    (0.0, 0.0)
-                                } else {
-                                    (re / mag, im / mag)
-                                };
-                                grad_z[2 * i] = g[i] * sign_re;
-                                grad_z[2 * i + 1] = g[i] * sign_im;
-                            }
-                            Ok(vec![Some(grad_z)])
-                        },
-                    )?;
-                    self.tensor_tape
-                        .save_custom_function_input_versions(out, &[input])?;
-                    out
-                } else {
-                    self.tensor_tape.leaf_tensor(output, false)
-                };
-                self.runtime.ledger_mut().record(
-                    EvidenceKind::Dispatch,
-                    format!("abs(complex) input={} out={}", input.0, out.0),
-                );
-                return Ok(out);
+        let dtype = self.tensor_dtype(input)?;
+        if matches!(dtype, DType::Complex64 | DType::Complex128) {
+            let requires_grad =
+                self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
+            if requires_grad {
+                let numel = Self::checked_shape_numel(
+                    self.tensor_tape.tensor_meta(input)?.shape(),
+                    "complex magnitude gradient element count overflow",
+                )?;
+                if numel > (isize::MAX as usize) / (2 * std::mem::size_of::<f64>()) {
+                    return Err(Self::incompatible_tensor_args(
+                        "complex magnitude gradient storage capacity overflow",
+                    ));
+                }
             }
+            // Read logical values while retaining the original bridge parent.
+            let tensor = self.tensor_tape.compact_tensor(input)?;
+            let meta = tensor.meta();
+            let storage = match tensor.typed_storage() {
+                TensorStorage::Complex64(values) => TensorStorage::F32(Arc::new(
+                    values.iter().map(|z| z.re.hypot(z.im)).collect(),
+                )),
+                TensorStorage::Complex128(values) => TensorStorage::F64(Arc::new(
+                    values.iter().map(|z| z.re.hypot(z.im)).collect(),
+                )),
+                _ => unreachable!("dtype is complex"),
+            };
+            let output = DenseTensor::from_typed_storage(
+                TensorMeta::from_shape(meta.shape().to_vec(), storage.dtype(), meta.device()),
+                storage,
+            )?;
+            let out = if requires_grad {
+                let saved = tensor.typed_storage().clone();
+                let out = self.tensor_tape.apply_complex_bridge(
+                    &[input],
+                    output,
+                    move |_ctx, grad_outputs| {
+                        // PyTorch uses grad * sgn(z), evaluated in the forward
+                        // dtype. Widening before hypot changes overflow and
+                        // rounding for Complex64; componentwise multiplication
+                        // also loses complex NaN propagation at infinite inputs.
+                        macro_rules! abs_gradient {
+                            ($values:expr, $complex:ident, $narrow:expr, $widen:expr) => {{
+                                let mut result = Vec::with_capacity($values.len() * 2);
+                                for (index, z) in $values.iter().enumerate() {
+                                    let sign = if z.re == 0.0 && z.im == 0.0 {
+                                        $complex::new(0.0, 0.0)
+                                    } else {
+                                        let magnitude = z.re.hypot(z.im);
+                                        $complex::new(z.re / magnitude, z.im / magnitude)
+                                    };
+                                    let incoming =
+                                        $complex::new(($narrow)(grad_outputs[0][index]), 0.0);
+                                    let derivative = incoming * sign;
+                                    result.extend([($widen)(derivative.re), ($widen)(derivative.im)]);
+                                }
+                                result
+                            }};
+                        }
+                        let gradient = match &saved {
+                            TensorStorage::Complex64(values) => {
+                                abs_gradient!(values, Complex64, |value: f64| value as f32, f64::from)
+                            }
+                            TensorStorage::Complex128(values) => {
+                                abs_gradient!(values, Complex128, |value: f64| value, |value: f64| {
+                                    value
+                                })
+                            }
+                            _ => unreachable!("complex magnitude only saves complex storage"),
+                        };
+                        Ok(vec![Some(gradient)])
+                    },
+                )?;
+                self.tensor_tape
+                    .save_custom_function_input_versions(out, &[input])?;
+                out
+            } else {
+                self.tensor_tape.leaf_tensor(output, false)
+            };
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!("abs(complex) input={} out={}", input.0, out.0),
+            );
+            return Ok(out);
         }
         let (out, event) = self.tensor_tape.abs(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -21347,27 +21363,20 @@ impl FrankenTorchSession {
                                     (incoming * *z) / (magnitude * magnitude)
                                         * $complex::new(0.0, 1.0)
                                 };
-                                result.extend([
-                                    ($widen)(derivative.re),
-                                    ($widen)(derivative.im),
-                                ]);
+                                result.extend([($widen)(derivative.re), ($widen)(derivative.im)]);
                             }
                             result
                         }};
                     }
                     let gradient = match &saved {
-                        TensorStorage::Complex64(values) => phase_gradient!(
-                            values,
-                            Complex64,
-                            |value: f64| value as f32,
-                            f64::from
-                        ),
-                        TensorStorage::Complex128(values) => phase_gradient!(
-                            values,
-                            Complex128,
-                            |value: f64| value,
-                            |value: f64| value
-                        ),
+                        TensorStorage::Complex64(values) => {
+                            phase_gradient!(values, Complex64, |value: f64| value as f32, f64::from)
+                        }
+                        TensorStorage::Complex128(values) => {
+                            phase_gradient!(values, Complex128, |value: f64| value, |value: f64| {
+                                value
+                            })
+                        }
                         _ => unreachable!("complex phase only saves complex storage"),
                     };
                     Ok(vec![Some(gradient)])
@@ -26072,50 +26081,73 @@ impl FrankenTorchSession {
 
     /// Element-wise phase angle (in radians) for real or complex tensors.
     ///
-    /// For Complex64/Complex128, returns F32/F64 `atan2(imag, real)` with
-    /// first-order complex gradients and a zero gradient at the origin.
+    /// Complex64/Complex128 return F32/F64 `atan2(imag, real)` with
+    /// first-order complex gradients and zero gradient at the origin.
     /// Higher-order complex differentiation reports an explicit error.
-    /// For real-valued tensors:
-    /// returns 0 where `x >= 0`, `π` where `x < 0`, and NaN where
-    /// `x` is NaN. Composes through autograd-aware `tensor_atan2`
-    /// with a zero left operand: `angle(x) = atan2(0, x)`. Useful
-    /// in pipelines that ingest signed-magnitude data and need
-    /// the phase channel separately. Tracked under
-    /// frankentorch-66hu.
+    /// Real floating inputs preserve their dtype and return zero for
+    /// nonnegative values (including negative zero), pi for negative values,
+    /// and NaN for NaN. Their backward is identically zero, even for nonfinite
+    /// inputs or incoming gradients, and supports `create_graph`.
     pub fn tensor_angle(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let dtype = self.tensor_dtype(input)?;
         if matches!(dtype, DType::Complex64 | DType::Complex128) {
             return self.tensor_complex_phase(input, false);
         }
-        // For real inputs, torch.angle returns 0 if x >= 0 and π if
-        // x < 0. The previous formulation atan2(0, x) gave π for both
-        // x = -0 and x < 0 (per IEEE 754 atan2(+0, -0) = π), which
-        // diverges from torch for the x = -0 case (torch treats -0
-        // and +0 identically since -0 == 0). Reformulated as
-        // where(isnan(x), NaN, where(x < 0, π, 0)) to also preserve
-        // NaN propagation. frankentorch-q76p.
-        // f32-native fast path: the where-chain below builds THREE 128MB f64 constant tensors
-        // (0/π/NaN) + lt + isnan + where x2 = ~9x SLOWER. `isnan ? NaN : x<0 ? π : 0` in one
-        // pass = bit-identical (x<0 is false for -0.0, matching the lt mask; NaN preserved).
-        if let Some(out) = self.try_f32_unary_native(input, |x| {
-            if x.is_nan() {
+        if !dtype.is_floating_point() {
+            return Err(AutogradError::DenseTensor(
+                ft_core::DenseTensorError::UnsupportedDType(dtype),
+            ));
+        }
+        let meta = self.tensor_tape.tensor_meta(input)?;
+        let numel = Self::checked_shape_numel(meta.shape(), "real angle element count overflow")?;
+        if numel > (isize::MAX as usize) / std::mem::size_of::<f64>() {
+            return Err(Self::incompatible_tensor_args(
+                "real angle storage capacity overflow",
+            ));
+        }
+        let phase = |value: f64| {
+            if value.is_nan() {
                 f64::NAN
-            } else if x < 0.0 {
+            } else if value < 0.0 {
                 std::f64::consts::PI
             } else {
                 0.0
             }
-        })? {
+        };
+        // This helper builds CPU tensors. Other device labels must take the
+        // typed custom-function path, which preserves the original metadata.
+        if meta.device() == Device::Cpu
+            && let Some(out) = self.try_f32_unary_native(input, phase)?
+        {
             return Ok(out);
         }
-        let shape = self.tensor_shape(input)?;
-        let zero_scalar = self.full(shape.clone(), 0.0, false)?;
-        let pi_scalar = self.full(shape.clone(), std::f64::consts::PI, false)?;
-        let nan_scalar = self.full(shape, f64::NAN, false)?;
-        let negative_mask = self.tensor_lt(input, zero_scalar)?;
-        let neg_or_zero = self.tensor_where(negative_mask, pi_scalar, zero_scalar)?;
-        let nan_mask = self.tensor_isnan(input)?;
-        self.tensor_where(nan_mask, nan_scalar, neg_or_zero)
+        let requires_grad =
+            self.tensor_tape.tensor_requires_grad(input)? && self.tensor_tape.is_grad_enabled();
+        let out = self.tensor_apply_function_with_create_graph(
+            &[input],
+            move |_ctx, inputs| {
+                let (values, shape) = inputs[0];
+                Ok((par_map_f64(values, phase), shape.to_vec()))
+            },
+            |_ctx, grad_outputs| Ok(vec![Some(vec![0.0; grad_outputs[0].len()])]),
+            |_ctx, _grad_outputs, inputs, tape| {
+                let meta = tape.tensor_meta(inputs[0])?;
+                let zero = DenseTensor::from_storage(
+                    TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+                    vec![0.0; meta.numel()],
+                )?;
+                Ok(vec![Some(tape.leaf_tensor(zero, false))])
+            },
+        )?;
+        if requires_grad {
+            self.tensor_tape
+                .save_custom_function_input_versions(out, &[input])?;
+        }
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("angle(real) input={} out={}", input.0, out.0),
+        );
+        Ok(out)
     }
 
     /// IEEE 754-2008 maxNum: NaN-tolerant element-wise maximum.
