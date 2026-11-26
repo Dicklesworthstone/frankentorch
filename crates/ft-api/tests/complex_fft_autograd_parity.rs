@@ -3244,13 +3244,7 @@ fn real_angle_create_graph_keeps_other_loss_curvature() {
             assert_eq!(first.gradient(input).unwrap(), &[-4.0, 0.5, -1.0, 6.0]);
             let first_node = first.gradient_node(input).unwrap();
             let second = session
-                .tensor_autograd_grad(
-                    &[first_node],
-                    &[input],
-                    Some(&[vec![1.0; 4]]),
-                    false,
-                    false,
-                )
+                .tensor_autograd_grad(&[first_node], &[input], Some(&[vec![1.0; 4]]), false, false)
                 .unwrap();
             assert_eq!(second[0].as_ref().unwrap(), &[2.0; 4]);
         }
@@ -3302,6 +3296,70 @@ fn real_angle_create_graph_zero_is_detached_and_saved_input_is_guarded() {
             let before = session.autograd_graph_node_count();
             assert!(session.tensor_angle(TensorNodeId(usize::MAX)).is_err());
             assert_eq!(session.autograd_graph_node_count(), before);
+        }
+    }
+}
+
+#[test]
+fn strided_native_products_preserve_weighted_first_second_and_third_derivatives() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32, DType::F16, DType::BF16] {
+            for create_graph in [false, true] {
+                let mut session = FrankenTorchSession::new(mode);
+                // Physical storage includes sentinels outside the logical view.
+                // Logical x is [-2, 0.25, -0.5, 3], not the storage-order slice.
+                let input = real_strided_leaf(
+                    &mut session,
+                    dtype,
+                    &[99.0, -2.0, -0.5, 0.25, 3.0, 77.0],
+                    &[2, 2],
+                    &[1, 2],
+                    1,
+                    true,
+                );
+                let square = session.tensor_mul(input, input).unwrap();
+                let cubic = session.tensor_mul(square, input).unwrap();
+                let first = session
+                    .tensor_autograd_grad_report(
+                        &[cubic],
+                        &[input],
+                        Some(&[vec![1.0, -2.0, 3.0, 0.5]]),
+                        create_graph,
+                        true,
+                    )
+                    .unwrap();
+                // For L = sum(w*x^3), dL/dx = 3*w*x^2.
+                assert_eq!(first.gradient(input).unwrap(), &[12.0, -0.375, 2.25, 13.5]);
+                if create_graph {
+                    let first_node = first.gradient_node(input).unwrap();
+                    let second = session
+                        .tensor_autograd_grad_report(
+                            &[first_node],
+                            &[input],
+                            Some(&[vec![1.0; 4]]),
+                            true,
+                            true,
+                        )
+                        .unwrap();
+                    // Diagonal Hessian 6*w*x, still connected to the same leaf.
+                    assert_eq!(second.gradient(input).unwrap(), &[-12.0, -3.0, -9.0, 9.0]);
+                    let second_node = second.gradient_node(input).unwrap();
+                    let third = session
+                        .tensor_autograd_grad(
+                            &[second_node],
+                            &[input],
+                            Some(&[vec![1.0; 4]]),
+                            false,
+                            false,
+                        )
+                        .unwrap();
+                    assert_eq!(third[0].as_ref().unwrap(), &[6.0, -12.0, 18.0, 3.0]);
+                }
+                assert_eq!(session.tensor_dtype(input).unwrap(), dtype);
+                let snapshot = session.tensor_snapshot(input).unwrap();
+                assert_eq!(snapshot.meta().strides(), &[1, 2]);
+                assert_eq!(snapshot.meta().storage_offset(), 1);
+            }
         }
     }
 }

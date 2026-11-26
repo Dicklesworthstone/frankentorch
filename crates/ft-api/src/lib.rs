@@ -20788,12 +20788,12 @@ impl FrankenTorchSession {
             let tensor = self.tensor_tape.compact_tensor(input)?;
             let meta = tensor.meta();
             let storage = match tensor.typed_storage() {
-                TensorStorage::Complex64(values) => TensorStorage::F32(Arc::new(
-                    values.iter().map(|z| z.re.hypot(z.im)).collect(),
-                )),
-                TensorStorage::Complex128(values) => TensorStorage::F64(Arc::new(
-                    values.iter().map(|z| z.re.hypot(z.im)).collect(),
-                )),
+                TensorStorage::Complex64(values) => {
+                    TensorStorage::F32(Arc::new(values.iter().map(|z| z.re.hypot(z.im)).collect()))
+                }
+                TensorStorage::Complex128(values) => {
+                    TensorStorage::F64(Arc::new(values.iter().map(|z| z.re.hypot(z.im)).collect()))
+                }
                 _ => unreachable!("dtype is complex"),
             };
             let output = DenseTensor::from_typed_storage(
@@ -20823,19 +20823,28 @@ impl FrankenTorchSession {
                                     let incoming =
                                         $complex::new(($narrow)(grad_outputs[0][index]), 0.0);
                                     let derivative = incoming * sign;
-                                    result.extend([($widen)(derivative.re), ($widen)(derivative.im)]);
+                                    result
+                                        .extend([($widen)(derivative.re), ($widen)(derivative.im)]);
                                 }
                                 result
                             }};
                         }
                         let gradient = match &saved {
                             TensorStorage::Complex64(values) => {
-                                abs_gradient!(values, Complex64, |value: f64| value as f32, f64::from)
+                                abs_gradient!(
+                                    values,
+                                    Complex64,
+                                    |value: f64| value as f32,
+                                    f64::from
+                                )
                             }
                             TensorStorage::Complex128(values) => {
-                                abs_gradient!(values, Complex128, |value: f64| value, |value: f64| {
-                                    value
-                                })
+                                abs_gradient!(
+                                    values,
+                                    Complex128,
+                                    |value: f64| value,
+                                    |value: f64| { value }
+                                )
                             }
                             _ => unreachable!("complex magnitude only saves complex storage"),
                         };

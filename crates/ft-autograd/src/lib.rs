@@ -20544,8 +20544,11 @@ impl TensorTape {
         let (requires_grad, result, shape, device) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
-            let lhs_data = lhs_node.tensor.contiguous_values_as_f64()?;
-            let rhs_data = rhs_node.tensor.contiguous_values_as_f64()?;
+            // Saved forward operands may be offset or strided leaves. Read
+            // their logical elements without replacing the original graph
+            // edges: subsequent derivatives must still reach those leaves.
+            let lhs_data = lhs_node.tensor.to_contiguous()?.contiguous_values_as_f64()?;
+            let rhs_data = rhs_node.tensor.to_contiguous()?.contiguous_values_as_f64()?;
             let lhs_shape = lhs_node.tensor.meta().shape().to_vec();
             let rhs_shape = rhs_node.tensor.meta().shape().to_vec();
             let device = lhs_node.tensor.meta().device();
@@ -23217,13 +23220,6 @@ impl TensorTape {
         meta.numel() * mult
     }
 
-    /// Borrow a node's contiguous values as `&[f64]` with zero copy when the
-    /// tensor is already contiguous f64 (the common case in backward); otherwise
-    /// fall back to the converting clone. Behaviour matches the prior
-    /// `contiguous_values_as_f64()` call exactly: contiguous f64 yields the same
-    /// values it would have cloned, non-f64 still converts, and any non-contiguous
-    /// tensor returns the identical `UnsupportedLayout` error (both accessors
-    /// reject non-contiguous layouts).
     /// Element count at or above which widening an F32 operand into the tape's f64 grad
     /// space is worth a rayon fork/join — `frankentorch-68pwz`.
     ///
@@ -23250,10 +23246,17 @@ impl TensorTape {
     /// BIT-EXACT BY CONSTRUCTION: every f32 is exactly representable in f64 and an
     /// elementwise map has no accumulation order, so splitting the range cannot change a
     /// bit. Asserted in `operand_values_cow_f32_matches_serial_bitwise` rather than assumed.
-    /// Non-contiguous and non-F32 dtypes fall through to the original path unchanged.
+    /// Strided operands are materialized in logical order; compact F64
+    /// operands retain the zero-copy path and other dtypes retain their
+    /// existing widening rules.
     fn operand_values_cow(
         tensor: &DenseTensor,
     ) -> Result<std::borrow::Cow<'_, [f64]>, AutogradError> {
+        if !tensor.meta().is_contiguous() {
+            return Ok(std::borrow::Cow::Owned(
+                tensor.to_contiguous()?.contiguous_values_as_f64()?,
+            ));
+        }
         if tensor.meta().dtype() == DType::F64 {
             return Ok(std::borrow::Cow::Borrowed(tensor.contiguous_values()?));
         }
