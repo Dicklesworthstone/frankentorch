@@ -44295,7 +44295,7 @@ mod tests {
                         assert_eq!(session.tensor_dtype(loss).unwrap(), dtype);
                         let mut expected_loss = Vec::new();
                         let mut expected_gradient = vec![0.0; logits.len()];
-                        for (sample, row) in logits.chunks_exact(3).enumerate() {
+                        for (sample, row) in logits.as_chunks::<3>().0.iter().enumerate() {
                             let denominator: f64 = row.iter().map(|value| value.exp()).sum();
                             let probabilities: Vec<_> =
                                 row.iter().map(|value| value.exp() / denominator).collect();
@@ -44520,7 +44520,8 @@ mod tests {
                             Reduction::Mean => [0.5; 2],
                             Reduction::Sum => [1.0; 2],
                         };
-                        for (sample, row) in gradient.chunks_exact_mut(4).enumerate() {
+                        for (sample, row) in gradient.as_chunks_mut::<4>().0.iter_mut().enumerate()
+                        {
                             for value in row {
                                 *value *= scales[sample];
                             }
@@ -44547,7 +44548,9 @@ mod tests {
                             // (2/C) * (v[j]-v[y]) to j and its negative to y.
                             let mut hessian_vector =
                                 [0.25, 0.0, -0.25, 0.0, -1.0, 0.5, -0.75, 1.25];
-                            for (sample, row) in hessian_vector.chunks_exact_mut(4).enumerate() {
+                            for (sample, row) in
+                                hessian_vector.as_chunks_mut::<4>().0.iter_mut().enumerate()
+                            {
                                 for value in row {
                                     *value *= scales[sample];
                                 }
@@ -45337,7 +45340,7 @@ mod tests {
                         Reduction::Mean => [1.0 / 3.0; 3],
                         Reduction::Sum => [1.0; 3],
                     };
-                    for (sample, row) in gradient.chunks_exact_mut(4).enumerate() {
+                    for (sample, row) in gradient.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                         for value in row {
                             *value *= scales[sample];
                         }

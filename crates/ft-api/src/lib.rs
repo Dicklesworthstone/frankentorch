@@ -8883,24 +8883,35 @@ impl FrankenTorchSession {
         }
     }
 
-    /// Multi-head attention forward pass.
+    /// Batched multi-head attention with packed Q/K/V projections.
     ///
-    /// Equivalent to `torch.nn.functional.multi_head_attention_forward`.
-    /// Projects query, key, value through linear layers, applies multi-head attention,
-    /// and projects output.
+    /// Supports the packed-projection, batched subset of
+    /// `torch.nn.functional.multi_head_attention_forward`, with an additional
+    /// `batch_first` layout option.
     ///
-    /// - `query`: `[tgt_len, batch, embed_dim]` or `[batch, tgt_len, embed_dim]` (if batch_first)
-    /// - `key`: `[src_len, batch, embed_dim]` or `[batch, src_len, embed_dim]`
-    /// - `value`: `[src_len, batch, embed_dim]` or `[batch, src_len, embed_dim]`
-    /// - `in_proj_weight`: combined Q/K/V projection `[3*embed_dim, embed_dim]`
-    /// - `in_proj_bias`: combined bias `[3*embed_dim]` (optional)
-    /// - `out_proj_weight`: output projection `[embed_dim, embed_dim]`
-    /// - `out_proj_bias`: output bias `[embed_dim]` (optional)
-    /// - `num_heads`: number of attention heads
-    /// - `dropout_p`: dropout probability
-    /// - `batch_first`: if true, input shape is `[batch, seq, embed]`
+    /// - `query`: `[L, N, E]`, or `[N, L, E]` when `batch_first` is true.
+    /// - `key` and `value`: `[S, N, E]`, or `[N, S, E]`.
+    /// - `in_proj_weight`: `[3 * E, E]`; optional `in_proj_bias`: `[3 * E]`.
+    /// - `out_proj_weight`: `[E, E]`; optional `out_proj_bias`: `[E]`.
+    /// - `attn_mask`: additive floating mask `[L, S]` or `[N * num_heads, L, S]`.
+    /// - `key_padding_mask`: additive floating mask `[N, S]`.
     ///
-    /// Returns `(attn_output, attn_weights)`.
+    /// Floating masks add directly to attention scores: zero keeps a position,
+    /// `-inf` excludes it, and other finite values bias its probability. Masks
+    /// may use F32 or the query/projection dtype. The SDPA path preserves F32
+    /// masks when accumulating half-precision attention in F32; the path that
+    /// returns weights uses the projected query dtype. Boolean masks are not
+    /// accepted.
+    ///
+    /// Dropout is applied whenever `dropout_p > 0`; pass zero during evaluation.
+    /// Unlike PyTorch's causal hint, `is_causal` applies a lower-triangular mask
+    /// and combines it with both supplied masks.
+    ///
+    /// Returns `(attn_output, attn_weights)`. When `need_weights` is true, the
+    /// returned `[N, L, S]` weights average the heads after dropout, and the
+    /// output uses those same per-head weights. This path uses ordinary
+    /// softmax, including NaNs for fully masked rows. With `need_weights=false`,
+    /// SDPA retains its fused kernels and zero per-head results for fully masked rows.
     #[allow(clippy::too_many_arguments)]
     pub fn multi_head_attention_forward(
         &mut self,
@@ -8919,75 +8930,191 @@ impl FrankenTorchSession {
         is_causal: bool,
         batch_first: bool,
     ) -> Result<(TensorNodeId, Option<TensorNodeId>), AutogradError> {
+        // Validate the complete call before adding nodes or consuming dropout
+        // randomness. In particular, never index a key/value shape before
+        // checking its rank, or accept equal-volume but incompatible batches.
         if num_heads == 0 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "multi_head_attention_forward: num_heads must be positive",
-                },
-            )));
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: num_heads must be positive",
+            ));
+        }
+        if !(0.0..=1.0).contains(&dropout_p) {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: dropout_p must be in [0, 1]",
+            ));
         }
         let q_shape = self.tensor_shape(query)?;
-        if q_shape.len() != 3 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "multi_head_attention_forward: query must be 3-D",
-                },
-            )));
+        let k_shape = self.tensor_shape(key)?;
+        let v_shape = self.tensor_shape(value)?;
+        if q_shape.len() != 3 || k_shape.len() != 3 || v_shape.len() != 3 {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: query, key and value must be 3-D",
+            ));
         }
-        let (tgt_len, bsz, embed_dim) = if batch_first {
-            (q_shape[1], q_shape[0], q_shape[2])
-        } else {
-            (q_shape[0], q_shape[1], q_shape[2])
-        };
-        if embed_dim % num_heads != 0 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "multi_head_attention_forward: embed_dim must be divisible by num_heads",
-                },
-            )));
+        let (seq_dim, batch_dim) = if batch_first { (1, 0) } else { (0, 1) };
+        let tgt_len = q_shape[seq_dim];
+        let bsz = q_shape[batch_dim];
+        let embed_dim = q_shape[2];
+        let src_len = k_shape[seq_dim];
+        if embed_dim == 0 || embed_dim % num_heads != 0 {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: embed_dim must be positive and divisible by num_heads",
+            ));
+        }
+        if k_shape[batch_dim] != bsz
+            || v_shape[batch_dim] != bsz
+            || v_shape[seq_dim] != src_len
+            || k_shape[2] != embed_dim
+            || v_shape[2] != embed_dim
+        {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: batches, key/value lengths and embedding dimensions must match",
+            ));
         }
         let head_dim = embed_dim / num_heads;
-        let k_shape = self.tensor_shape(key)?;
-        let src_len = if batch_first { k_shape[1] } else { k_shape[0] };
+        let proj_dim = Self::checked_mul(
+            3,
+            embed_dim,
+            "multi_head_attention_forward: projection size overflow",
+        )?;
+        let query_rows = Self::checked_mul(
+            tgt_len,
+            bsz,
+            "multi_head_attention_forward: query batch size overflow",
+        )?;
+        let key_rows = Self::checked_mul(
+            src_len,
+            bsz,
+            "multi_head_attention_forward: key batch size overflow",
+        )?;
+        let batch_heads = Self::checked_mul(
+            bsz,
+            num_heads,
+            "multi_head_attention_forward: batch/head size overflow",
+        )?;
+        Self::checked_shape_numel(
+            &[bsz, num_heads, tgt_len, src_len],
+            "multi_head_attention_forward: attention size overflow",
+        )?;
+        let apply_causal = is_causal && bsz != 0 && tgt_len != 0 && src_len != 0;
+        let causal_numel = if apply_causal {
+            Self::checked_mul(
+                tgt_len,
+                src_len,
+                "multi_head_attention_forward: causal mask size overflow",
+            )?
+        } else {
+            0
+        };
+        if self.tensor_shape(in_proj_weight)? != [proj_dim, embed_dim]
+            || self.tensor_shape(out_proj_weight)? != [embed_dim, embed_dim]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: projection weights must have shapes [3*E, E] and [E, E]",
+            ));
+        }
+        if let Some(bias) = in_proj_bias
+            && self.tensor_shape(bias)? != [proj_dim]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: in_proj_bias must have shape [3*E]",
+            ));
+        }
+        if let Some(bias) = out_proj_bias
+            && self.tensor_shape(bias)? != [embed_dim]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: out_proj_bias must have shape [E]",
+            ));
+        }
 
-        // Transpose to [seq, batch, embed] if batch_first
+        let query_dtype = self.tensor_dtype(query)?;
+        let device = self.tensor_device(query)?;
+        let autocast_dtype = self.autocast_dtype();
+        let projected_dtype = |dtype| match (autocast_dtype, dtype) {
+            (Some(target), DType::F32 | DType::F16 | DType::BF16) => target,
+            _ => dtype,
+        };
+        let expected_dtype = projected_dtype(query_dtype);
+        for input in [query, key, value, in_proj_weight, out_proj_weight]
+            .into_iter()
+            .chain(in_proj_bias)
+            .chain(out_proj_bias)
+        {
+            let dtype = self.tensor_dtype(input)?;
+            if !dtype.is_floating_point() || projected_dtype(dtype) != expected_dtype {
+                return Err(Self::incompatible_tensor_args(
+                    "multi_head_attention_forward: inputs and projections must have the same floating dtype after autocast",
+                ));
+            }
+            if self.tensor_device(input)? != device {
+                return Err(Self::incompatible_tensor_args(
+                    "multi_head_attention_forward: inputs and projections must be on the same device",
+                ));
+            }
+        }
+        if let Some(mask) = attn_mask {
+            let shape = self.tensor_shape(mask)?;
+            if shape != [tgt_len, src_len] && shape != [batch_heads, tgt_len, src_len] {
+                return Err(Self::incompatible_tensor_args(
+                    "multi_head_attention_forward: attn_mask must have shape [L, S] or [N*num_heads, L, S]",
+                ));
+            }
+        }
+        if let Some(mask) = key_padding_mask
+            && self.tensor_shape(mask)? != [bsz, src_len]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "multi_head_attention_forward: key_padding_mask must have shape [N, S]",
+            ));
+        }
+        for mask in attn_mask.into_iter().chain(key_padding_mask) {
+            let dtype = self.tensor_dtype(mask)?;
+            if !dtype.is_floating_point()
+                || (dtype != DType::F32 && dtype != query_dtype && dtype != expected_dtype)
+            {
+                return Err(Self::incompatible_tensor_args(
+                    "multi_head_attention_forward: additive masks must use F32 or the query/projection dtype",
+                ));
+            }
+            if self.tensor_device(mask)? != device {
+                return Err(Self::incompatible_tensor_args(
+                    "multi_head_attention_forward: masks must be on the query device",
+                ));
+            }
+        }
+
+        // Normalize the input layout, then project through the AMP-aware linear
+        // primitive so biases follow the same dtype as activations and weights.
         let (q, k, v) = if batch_first {
-            let q_t = self.tensor_transpose(query, 0, 1)?;
-            let k_t = self.tensor_transpose(key, 0, 1)?;
-            let v_t = self.tensor_transpose(value, 0, 1)?;
-            (q_t, k_t, v_t)
+            (
+                self.tensor_transpose(query, 0, 1)?,
+                self.tensor_transpose(key, 0, 1)?,
+                self.tensor_transpose(value, 0, 1)?,
+            )
         } else {
             (query, key, value)
         };
-
-        // Reshape [seq, batch, embed] -> [seq*batch, embed]
-        let q_flat = self.tensor_reshape(q, vec![tgt_len * bsz, embed_dim])?;
-        let k_flat = self.tensor_reshape(k, vec![src_len * bsz, embed_dim])?;
-        let v_flat = self.tensor_reshape(v, vec![src_len * bsz, embed_dim])?;
-
-        // Apply combined Q/K/V projection: [seq*batch, embed] @ [embed, 3*embed]^T
-        let in_proj_weight_t = self.tensor_transpose(in_proj_weight, 0, 1)?;
-        let w_q = self.tensor_narrow(in_proj_weight_t, 1, 0, embed_dim)?;
-        let w_k = self.tensor_narrow(in_proj_weight_t, 1, embed_dim, embed_dim)?;
-        let w_v = self.tensor_narrow(in_proj_weight_t, 1, 2 * embed_dim, embed_dim)?;
-        let q_proj = self.tensor_matmul(q_flat, w_q)?;
-        let k_proj = self.tensor_matmul(k_flat, w_k)?;
-        let v_proj = self.tensor_matmul(v_flat, w_v)?;
-
-        // Add biases if present
-        let (q_proj, k_proj, v_proj) = if let Some(bias) = in_proj_bias {
-            let q_bias = self.tensor_narrow(bias, 0, 0, embed_dim)?;
-            let k_bias = self.tensor_narrow(bias, 0, embed_dim, embed_dim)?;
-            let v_bias = self.tensor_narrow(bias, 0, 2 * embed_dim, embed_dim)?;
-            let q_proj = self.tensor_add(q_proj, q_bias)?;
-            let k_proj = self.tensor_add(k_proj, k_bias)?;
-            let v_proj = self.tensor_add(v_proj, v_bias)?;
-            (q_proj, k_proj, v_proj)
+        let q_flat = self.tensor_reshape(q, vec![query_rows, embed_dim])?;
+        let k_flat = self.tensor_reshape(k, vec![key_rows, embed_dim])?;
+        let v_flat = self.tensor_reshape(v, vec![key_rows, embed_dim])?;
+        let w_q = self.tensor_narrow(in_proj_weight, 0, 0, embed_dim)?;
+        let w_k = self.tensor_narrow(in_proj_weight, 0, embed_dim, embed_dim)?;
+        let w_v = self.tensor_narrow(in_proj_weight, 0, 2 * embed_dim, embed_dim)?;
+        let (b_q, b_k, b_v) = if let Some(bias) = in_proj_bias {
+            (
+                Some(self.tensor_narrow(bias, 0, 0, embed_dim)?),
+                Some(self.tensor_narrow(bias, 0, embed_dim, embed_dim)?),
+                Some(self.tensor_narrow(bias, 0, 2 * embed_dim, embed_dim)?),
+            )
         } else {
-            (q_proj, k_proj, v_proj)
+            (None, None, None)
         };
+        let q_proj = self.functional_linear(q_flat, w_q, b_q)?;
+        let k_proj = self.functional_linear(k_flat, w_k, b_k)?;
+        let v_proj = self.functional_linear(v_flat, w_v, b_v)?;
 
-        // Reshape to [batch, num_heads, seq_len, head_dim]
+        // [seq, batch, heads, head_dim] -> [batch, heads, seq, head_dim].
         let q_heads = self.tensor_reshape(q_proj, vec![tgt_len, bsz, num_heads, head_dim])?;
         let q_heads = self.tensor_permute(q_heads, vec![1, 2, 0, 3])?;
         let k_heads = self.tensor_reshape(k_proj, vec![src_len, bsz, num_heads, head_dim])?;
@@ -8995,75 +9122,95 @@ impl FrankenTorchSession {
         let v_heads = self.tensor_reshape(v_proj, vec![src_len, bsz, num_heads, head_dim])?;
         let v_heads = self.tensor_permute(v_heads, vec![1, 2, 0, 3])?;
 
-        // Apply key_padding_mask if present
-        let effective_mask = match (attn_mask, key_padding_mask) {
-            (Some(am), Some(kpm)) => {
-                // Combine: expand key_padding_mask and add to attn_mask
-                let kpm_expanded = self.tensor_unsqueeze(kpm, 1)?;
-                let kpm_expanded = self.tensor_unsqueeze(kpm_expanded, 2)?;
-                let kpm_shape = self.tensor_shape(kpm_expanded)?;
-                let zeros = self.tensor_zeros(kpm_shape, false)?;
-                let kpm_float = self.tensor_masked_fill(zeros, kpm_expanded, f64::NEG_INFINITY)?;
-                Some(self.tensor_add(am, kpm_float)?)
-            }
-            (Some(am), None) => Some(am),
-            (None, Some(kpm)) => {
-                let kpm_expanded = self.tensor_unsqueeze(kpm, 1)?;
-                let kpm_expanded = self.tensor_unsqueeze(kpm_expanded, 2)?;
-                let kpm_shape = self.tensor_shape(kpm_expanded)?;
-                let zeros = self.tensor_zeros(kpm_shape, false)?;
-                Some(self.tensor_masked_fill(zeros, kpm_expanded, f64::NEG_INFINITY)?)
-            }
+        let attention_dtype = self.tensor_dtype(q_heads)?;
+        // SDPA accumulates half-precision attention in F32 and accepts F32
+        // masks without narrowing them first. Preserve finite biases that
+        // would overflow a half-precision mask before reaching that path.
+        let mask_dtype = if !need_weights && attention_dtype.is_half() {
+            DType::F32
+        } else {
+            attention_dtype
+        };
+        let attn_mask = attn_mask
+            .map(|mask| {
+                let mask = self.tensor_to_dtype(mask, mask_dtype)?;
+                if self.tensor_shape(mask)?.len() == 3 {
+                    self.tensor_reshape(mask, vec![bsz, num_heads, tgt_len, src_len])
+                } else {
+                    Ok(mask)
+                }
+            })
+            .transpose()?;
+        let padding_mask = key_padding_mask
+            .map(|mask| {
+                let mask = self.tensor_to_dtype(mask, mask_dtype)?;
+                self.tensor_reshape(mask, vec![bsz, 1, 1, src_len])
+            })
+            .transpose()?;
+        // Floating padding masks are additive biases, not nonzero predicates.
+        let mut effective_mask = match (attn_mask, padding_mask) {
+            (Some(attention), Some(padding)) => Some(self.tensor_add(attention, padding)?),
+            (Some(mask), None) | (None, Some(mask)) => Some(mask),
             (None, None) => None,
         };
+        let causal_via_sdpa = apply_causal && !need_weights && effective_mask.is_none();
+        if apply_causal && !causal_via_sdpa {
+            let mut values = vec![0.0; causal_numel];
+            for i in 0..tgt_len {
+                for j in i.saturating_add(1)..src_len {
+                    values[i * src_len + j] = f64::NEG_INFINITY;
+                }
+            }
+            let causal =
+                DenseTensor::from_contiguous_values(values, vec![tgt_len, src_len], device)?
+                    .to_dtype(mask_dtype)?;
+            let causal = self.tensor_variable_from_storage(causal, false);
+            effective_mask = Some(match effective_mask {
+                Some(mask) => self.tensor_add(mask, causal)?,
+                None => causal,
+            });
+        }
 
-        // Apply scaled_dot_product_attention
-        let attn_output = self.scaled_dot_product_attention(
-            q_heads,
-            k_heads,
-            v_heads,
-            effective_mask,
-            dropout_p,
-            is_causal,
-        )?;
-
-        // Compute attention weights if needed
-        let attn_weights_out = if need_weights {
-            let scale = 1.0 / (head_dim as f64).sqrt();
-            let k_t = self.tensor_transpose(k_heads, 2, 3)?;
-            let scores = self.tensor_matmul(q_heads, k_t)?;
-            let scores_shape = self.tensor_shape(scores)?;
-            let scale_tensor = self.full(scores_shape.clone(), scale, false)?;
-            let scaled = self.tensor_mul(scores, scale_tensor)?;
-            let softmax_dim = scores_shape.len() - 1;
-            let weights = self.tensor_softmax(scaled, softmax_dim)?;
-            // Average over head dimension (dim 1)
-            let avg_weights = self.tensor_mean_dim(weights, 1)?;
-            Some(avg_weights)
+        let (attn_output, attn_weights_out) = if need_weights {
+            // Materialize probabilities only when they are requested. The same
+            // post-dropout tensor drives both returned weights and the output,
+            // preserving their masks, random draw, and shared gradient graph.
+            // Scale Q before the product so a representable scaled score does
+            // not overflow in an unscaled half-precision dot product.
+            let scaled_q = self.tensor_mul_scalar(q_heads, 1.0 / (head_dim as f64).sqrt())?;
+            let scaled_q = self.tensor_to_dtype(scaled_q, attention_dtype)?;
+            let key_t = self.tensor_transpose(k_heads, 2, 3)?;
+            let scores = self.tensor_matmul(scaled_q, key_t)?;
+            let masked = match effective_mask {
+                Some(mask) => self.tensor_add(scores, mask)?,
+                None => scores,
+            };
+            let weights = self.tensor_softmax(masked, 3)?;
+            let weights = self.functional_dropout(weights, dropout_p, true)?;
+            let output = self.tensor_matmul(weights, v_heads)?;
+            let averaged = self.tensor_mean_dim(weights, 1)?;
+            (output, Some(averaged))
         } else {
-            None
+            let output = self.scaled_dot_product_attention(
+                q_heads,
+                k_heads,
+                v_heads,
+                effective_mask,
+                dropout_p,
+                causal_via_sdpa,
+            )?;
+            (output, None)
         };
 
-        // Reshape: [batch, num_heads, tgt_len, head_dim] -> [tgt_len, batch, embed_dim]
         let attn_output = self.tensor_permute(attn_output, vec![2, 0, 1, 3])?;
-        let attn_output = self.tensor_reshape(attn_output, vec![tgt_len, bsz, embed_dim])?;
-
-        // Flatten for output projection
-        let attn_flat = self.tensor_reshape(attn_output, vec![tgt_len * bsz, embed_dim])?;
-        let out_proj_weight_t = self.tensor_transpose(out_proj_weight, 0, 1)?;
-        let mut output = self.tensor_matmul(attn_flat, out_proj_weight_t)?;
-        if let Some(bias) = out_proj_bias {
-            output = self.tensor_add(output, bias)?;
-        }
+        let attn_flat = self.tensor_reshape(attn_output, vec![query_rows, embed_dim])?;
+        let output = self.functional_linear(attn_flat, out_proj_weight, out_proj_bias)?;
         let output = self.tensor_reshape(output, vec![tgt_len, bsz, embed_dim])?;
-
-        // Transpose back if batch_first
         let output = if batch_first {
             self.tensor_transpose(output, 0, 1)?
         } else {
             output
         };
-
         Ok((output, attn_weights_out))
     }
 

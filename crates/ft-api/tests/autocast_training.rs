@@ -1054,3 +1054,912 @@ fn state_restore_rejects_backward_through_stale_borrowed_forward() {
             if node == parameter && recorded == version && observed == version + 1
     ));
 }
+
+fn mha_leaf(
+    session: &mut FrankenTorchSession,
+    values: &[f64],
+    shape: &[usize],
+    dtype: DType,
+    requires_grad: bool,
+) -> TensorNodeId {
+    if dtype == DType::F64 {
+        session
+            .tensor_variable(values.to_vec(), shape.to_vec(), requires_grad)
+            .unwrap()
+    } else {
+        assert_eq!(dtype, DType::F32);
+        session
+            .tensor_variable_f32(
+                values.iter().map(|&value| value as f32).collect(),
+                shape.to_vec(),
+                requires_grad,
+            )
+            .unwrap()
+    }
+}
+
+fn mha_assert_close(actual: &[f64], expected: &[f64], dtype: DType) {
+    assert_eq!(actual.len(), expected.len());
+    let tolerance = if dtype == DType::F64 { 2e-12 } else { 2e-5 };
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= tolerance * (1.0 + expected.abs()),
+            "entry {index}: actual={actual}, expected={expected}, dtype={dtype:?}"
+        );
+    }
+}
+
+#[test]
+fn functional_mha_autocast_preserves_finite_scores_and_full_precision_masks() {
+    for dtype in [DType::F16, DType::BF16] {
+        for full_precision_mask in [false, true] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let magnitude = if full_precision_mask { 0. } else { 200. };
+            let q = mha_leaf(&mut s, &[magnitude; 2], &[1, 1, 2], DType::F32, true);
+            let k = mha_leaf(
+                &mut s,
+                &[magnitude, magnitude, 0., 0.],
+                &[1, 2, 2],
+                DType::F32,
+                true,
+            );
+            let v = mha_leaf(&mut s, &[2., 4., 6., 8.], &[1, 2, 2], DType::F32, true);
+            let w = mha_leaf(
+                &mut s,
+                &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                &[6, 2],
+                DType::F32,
+                true,
+            );
+            let out_w = mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], DType::F32, true);
+            let mask = full_precision_mask
+                .then(|| mha_leaf(&mut s, &[70_000., 0.], &[1, 2], DType::F32, true));
+            // 200*200 + 200*200 overflows F16, but scaling Q first keeps
+            // the score finite. In the SDPA branch, the F32 mask must not
+            // narrow 70000 to F16 infinity before F32 attention accumulation.
+            let need_weights = !full_precision_mask;
+            let (output, weights) = s
+                .with_autocast(dtype, |s| {
+                    s.multi_head_attention_forward(
+                        q,
+                        k,
+                        v,
+                        w,
+                        None,
+                        out_w,
+                        None,
+                        1,
+                        0.,
+                        mask,
+                        None,
+                        need_weights,
+                        false,
+                        true,
+                    )
+                })
+                .unwrap();
+            assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+            assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), [2., 4.]);
+            if let Some(weights) = weights {
+                assert_eq!(s.tensor_values_lossy_f64(weights).unwrap(), [1., 0.]);
+            } else {
+                assert!(!need_weights);
+            }
+            let loss = weighted_loss(&mut s, output, vec![2., -3.]);
+            let report = s.tensor_backward(loss).unwrap();
+            assert_eq!(s.tensor_gradient(&report, q).unwrap(), [0.; 2]);
+            assert_eq!(s.tensor_gradient(&report, k).unwrap(), [0.; 4]);
+            assert_eq!(s.tensor_gradient(&report, v).unwrap(), [2., -3., 0., 0.]);
+            if let Some(mask) = mask {
+                assert_eq!(s.tensor_gradient(&report, mask).unwrap(), [0.; 2]);
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_additive_masks_and_joint_weight_loss_have_analytic_gradients() {
+    // Scores after scaling and both additive masks are ln(2) and ln(6).
+    // Thus p=[1/4,3/4]. The returned-weight loss changes the score adjoint
+    // from [-3/2,3/2] to [-3/4,3/4], and reaches both floating masks.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32] {
+            for need_weights in [false, true] {
+                let mut s = FrankenTorchSession::new(mode);
+                let root_two = 2.0_f64.sqrt();
+                let log_three = 3.0_f64.ln();
+                let nodes = [
+                    mha_leaf(&mut s, &[1., 0.], &[1, 1, 2], dtype, true),
+                    mha_leaf(
+                        &mut s,
+                        &[0., 0., root_two * log_three, 0.],
+                        &[1, 2, 2],
+                        dtype,
+                        true,
+                    ),
+                    mha_leaf(&mut s, &[2., 0., 6., 0.], &[1, 2, 2], dtype, true),
+                    mha_leaf(
+                        &mut s,
+                        &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                        &[6, 2],
+                        dtype,
+                        true,
+                    ),
+                    mha_leaf(&mut s, &[0.; 6], &[6], dtype, true),
+                    mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], dtype, true),
+                    mha_leaf(&mut s, &[0.; 2], &[2], dtype, true),
+                    mha_leaf(&mut s, &[2.0_f64.ln(), 0.], &[1, 2], dtype, true),
+                    mha_leaf(&mut s, &[0., 2.0_f64.ln()], &[1, 2], dtype, true),
+                ];
+                let [q, k, v, w, b, out_w, out_b, mask, padding] = nodes;
+                let (output, weights) = s
+                    .functional_multi_head_attention_forward(
+                        q,
+                        k,
+                        v,
+                        w,
+                        Some(b),
+                        out_w,
+                        Some(out_b),
+                        1,
+                        0.,
+                        Some(mask),
+                        Some(padding),
+                        need_weights,
+                        false,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                assert_eq!(s.tensor_shape(output).unwrap(), [1, 1, 2]);
+                mha_assert_close(
+                    &s.tensor_values_lossy_f64(output).unwrap(),
+                    &[5., 0.],
+                    dtype,
+                );
+                let mut outputs = vec![output];
+                let mut upstream = vec![vec![2., 0.]];
+                if let Some(weights) = weights {
+                    assert!(need_weights);
+                    assert_eq!(s.tensor_dtype(weights).unwrap(), dtype);
+                    assert_eq!(s.tensor_shape(weights).unwrap(), [1, 1, 2]);
+                    mha_assert_close(
+                        &s.tensor_values_lossy_f64(weights).unwrap(),
+                        &[0.25, 0.75],
+                        dtype,
+                    );
+                    outputs.push(weights);
+                    upstream.push(vec![3., -1.]);
+                } else {
+                    assert!(!need_weights);
+                }
+                let gradients = s
+                    .tensor_autograd_grad(&outputs, &nodes, Some(&upstream), false, false)
+                    .unwrap();
+                let g = if need_weights { 0.75 } else { 1.5 };
+                let qk = g * log_three;
+                let expected = [
+                    vec![qk, 0.],
+                    vec![-g / root_two, 0., g / root_two, 0.],
+                    vec![0.5, 0., 1.5, 0.],
+                    vec![qk, 0., 0., 0., qk, 0., 0., 0., 10., 0., 0., 0.],
+                    vec![qk, 0., 0., 0., 2., 0.],
+                    vec![10., 0., 0., 0.],
+                    vec![2., 0.],
+                    vec![-g, g],
+                    vec![-g, g],
+                ];
+                for (gradient, expected) in gradients.iter().zip(&expected) {
+                    mha_assert_close(gradient.as_deref().unwrap(), expected, dtype);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_per_head_masks_preserve_batch_layout_and_weight_gradients() {
+    // Four independently chosen head distributions: [3/4,1/4],
+    // [1/4,3/4], [2/3,1/3], and [1/2,1/2], ordered by batch then head.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32] {
+            for batch_first in [false, true] {
+                let mut s = FrankenTorchSession::new(mode);
+                let nodes = [
+                    mha_leaf(&mut s, &[0.; 4], &[2, 1, 2], dtype, true),
+                    mha_leaf(&mut s, &[0.; 8], &[2, 2, 2], dtype, true),
+                    mha_leaf(
+                        &mut s,
+                        &[2., 3., 5., 7., 11., 13., 17., 19.],
+                        &[2, 2, 2],
+                        dtype,
+                        true,
+                    ),
+                    mha_leaf(
+                        &mut s,
+                        &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                        &[6, 2],
+                        dtype,
+                        true,
+                    ),
+                    mha_leaf(&mut s, &[0.; 6], &[6], dtype, true),
+                    mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], dtype, true),
+                    mha_leaf(&mut s, &[0.; 2], &[2], dtype, true),
+                    mha_leaf(
+                        &mut s,
+                        &[3.0_f64.ln(), 0., 0., 3.0_f64.ln(), 2.0_f64.ln(), 0., 0., 0.],
+                        &[4, 1, 2],
+                        dtype,
+                        true,
+                    ),
+                ];
+                let [q, k, v, w, b, out_w, out_b, mask] = nodes;
+                let [q, k, v] = if batch_first {
+                    [q, k, v]
+                } else {
+                    [
+                        s.tensor_transpose(q, 0, 1).unwrap(),
+                        s.tensor_transpose(k, 0, 1).unwrap(),
+                        s.tensor_transpose(v, 0, 1).unwrap(),
+                    ]
+                };
+                let (output, weights) = s
+                    .multi_head_attention_forward(
+                        q,
+                        k,
+                        v,
+                        w,
+                        Some(b),
+                        out_w,
+                        Some(out_b),
+                        2,
+                        0.,
+                        Some(mask),
+                        None,
+                        true,
+                        false,
+                        batch_first,
+                    )
+                    .unwrap();
+                let output = if batch_first {
+                    output
+                } else {
+                    s.tensor_transpose(output, 0, 1).unwrap()
+                };
+                let weights = weights.unwrap();
+                assert_eq!(s.tensor_shape(output).unwrap(), [2, 1, 2]);
+                assert_eq!(s.tensor_shape(weights).unwrap(), [2, 1, 2]);
+                mha_assert_close(
+                    &s.tensor_values_lossy_f64(output).unwrap(),
+                    &[2.75, 6., 13., 16.],
+                    dtype,
+                );
+                mha_assert_close(
+                    &s.tensor_values_lossy_f64(weights).unwrap(),
+                    &[0.5, 0.5, 7. / 12., 5. / 12.],
+                    dtype,
+                );
+                let gradients = s
+                    .tensor_autograd_grad(
+                        &[output, weights],
+                        &nodes,
+                        Some(&[vec![2., -1., 3., 4.], vec![1., -1., 2., -2.]]),
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                let expected = [
+                    vec![0.; 4],
+                    vec![0.; 8],
+                    vec![1.5, -0.25, 0.5, -0.75, 2., 2., 1., 2.],
+                    vec![0., 0., 0., 0., 0., 0., 0., 0., 44.5, 53., 51.75, 58.],
+                    vec![0., 0., 0., 0., 5., 3.],
+                    vec![44.5, 60., 49.25, 58.],
+                    vec![5., 3.],
+                    vec![
+                        -15. / 16.,
+                        15. / 16.,
+                        15. / 16.,
+                        -15. / 16.,
+                        -32. / 9.,
+                        32. / 9.,
+                        -5.5,
+                        5.5,
+                    ],
+                ];
+                for (gradient, expected) in gradients.iter().zip(&expected) {
+                    mha_assert_close(gradient.as_deref().unwrap(), expected, dtype);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_dropout_shares_weights_gradients_and_one_random_draw_sequence() {
+    // Independently simulated xoshiro256++ seed 21 begins .8386, .4517,
+    // .7179, .4446. At p=1/2 exactly positions 0 and 2 survive, scaled by two.
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32] {
+            for need_weights in [false, true] {
+                for probability in [0.5, 1.0] {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let nodes = [
+                        mha_leaf(&mut s, &[1.], &[1, 1, 1], dtype, true),
+                        mha_leaf(&mut s, &[0.; 4], &[1, 4, 1], dtype, true),
+                        mha_leaf(&mut s, &[2., 4., 6., 8.], &[1, 4, 1], dtype, true),
+                        mha_leaf(&mut s, &[1.; 3], &[3, 1], dtype, true),
+                        mha_leaf(&mut s, &[1.], &[1, 1], dtype, true),
+                    ];
+                    let [q, k, v, w, out_w] = nodes;
+                    s.manual_seed(21);
+                    let mut reference = s.clone();
+                    if probability < 1.0 {
+                        reference.rand(vec![4], false).unwrap();
+                    }
+                    let (output, weights) = s
+                        .multi_head_attention_forward(
+                            q,
+                            k,
+                            v,
+                            w,
+                            None,
+                            out_w,
+                            None,
+                            1,
+                            probability,
+                            None,
+                            None,
+                            need_weights,
+                            false,
+                            true,
+                        )
+                        .unwrap();
+                    let value = if probability < 1.0 { 4. } else { 0. };
+                    mha_assert_close(&s.tensor_values_lossy_f64(output).unwrap(), &[value], dtype);
+                    let mut outputs = vec![output];
+                    let mut upstream = vec![vec![2.]];
+                    if let Some(weights) = weights {
+                        assert!(need_weights);
+                        let expected = if probability < 1.0 {
+                            vec![0.5, 0., 0.5, 0.]
+                        } else {
+                            vec![0.; 4]
+                        };
+                        mha_assert_close(
+                            &s.tensor_values_lossy_f64(weights).unwrap(),
+                            &expected,
+                            dtype,
+                        );
+                        outputs.push(weights);
+                        upstream.push(vec![3., -1., 4., -2.]);
+                    } else {
+                        assert!(!need_weights);
+                    }
+                    let gradients = s
+                        .tensor_autograd_grad(&outputs, &nodes, Some(&upstream), false, false)
+                        .unwrap();
+                    let expected = if probability == 1.0 {
+                        [vec![0.], vec![0.; 4], vec![0.; 4], vec![0.; 3], vec![0.]]
+                    } else {
+                        [
+                            vec![0.],
+                            if need_weights {
+                                vec![5. / 8., -23. / 8., 41. / 8., -23. / 8.]
+                            } else {
+                                vec![0., -2., 4., -2.]
+                            },
+                            vec![1., 0., 1., 0.],
+                            vec![0., 0., 8.],
+                            vec![8.],
+                        ]
+                    };
+                    for (gradient, expected) in gradients.iter().zip(&expected) {
+                        mha_assert_close(gradient.as_deref().unwrap(), expected, dtype);
+                    }
+                    let next = s.rand(vec![5], false).unwrap();
+                    let expected_next = reference.rand(vec![5], false).unwrap();
+                    assert_eq!(
+                        s.tensor_values(next).unwrap(),
+                        reference.tensor_values(expected_next).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_causal_padding_and_fully_masked_rows_follow_each_branch() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F64, DType::F32] {
+            for need_weights in [false, true] {
+                for case in 0..3 {
+                    let mut s = FrankenTorchSession::new(mode);
+                    let q = mha_leaf(&mut s, &[0.; 2], &[1, 2, 1], dtype, true);
+                    let k = mha_leaf(&mut s, &[0.; 2], &[1, 2, 1], dtype, true);
+                    let v = mha_leaf(&mut s, &[2., 6.], &[1, 2, 1], dtype, true);
+                    let w = mha_leaf(&mut s, &[1.; 3], &[3, 1], dtype, true);
+                    let out_w = mha_leaf(&mut s, &[1.], &[1, 1], dtype, true);
+                    let out_b = mha_leaf(&mut s, &[3.], &[1], dtype, true);
+                    let mask = match case {
+                        0 => Some(mha_leaf(
+                            &mut s,
+                            &[0., f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY],
+                            &[2, 2],
+                            dtype,
+                            false,
+                        )),
+                        1 => None,
+                        _ => Some(mha_leaf(&mut s, &[0.; 4], &[2, 2], dtype, false)),
+                    };
+                    let padding = (case == 2)
+                        .then(|| mha_leaf(&mut s, &[0., 3.0_f64.ln()], &[1, 2], dtype, false));
+                    let (output, weights) = s
+                        .multi_head_attention_forward(
+                            q,
+                            k,
+                            v,
+                            w,
+                            None,
+                            out_w,
+                            Some(out_b),
+                            1,
+                            0.,
+                            mask,
+                            padding,
+                            need_weights,
+                            case != 0,
+                            true,
+                        )
+                        .unwrap();
+                    let actual = s.tensor_values_lossy_f64(output).unwrap();
+                    mha_assert_close(&actual[..1], &[5.], dtype);
+                    if case == 0 && need_weights {
+                        assert!(actual[1].is_nan());
+                    } else {
+                        let expected = [3., 7., 8.][case];
+                        mha_assert_close(&actual[1..], &[expected], dtype);
+                    }
+                    if let Some(weights) = weights {
+                        let actual = s.tensor_values_lossy_f64(weights).unwrap();
+                        mha_assert_close(&actual[..2], &[1., 0.], dtype);
+                        if case == 0 {
+                            assert!(actual[2..].iter().all(|value| value.is_nan()));
+                        } else {
+                            let expected = if case == 1 { [0.5, 0.5] } else { [0.25, 0.75] };
+                            mha_assert_close(&actual[2..], &expected, dtype);
+                        }
+                    } else {
+                        assert!(!need_weights);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_empty_axes_keep_output_shapes_and_do_not_advance_rng() {
+    for dtype in [DType::F64, DType::F32] {
+        for (batch, queries, keys) in [(0, 2, 3), (2, 0, 3), (2, 2, 0)] {
+            for need_weights in [false, true] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let q = mha_leaf(
+                    &mut s,
+                    &vec![0.; batch * queries * 2],
+                    &[batch, queries, 2],
+                    dtype,
+                    true,
+                );
+                let k = mha_leaf(
+                    &mut s,
+                    &vec![0.; batch * keys * 2],
+                    &[batch, keys, 2],
+                    dtype,
+                    true,
+                );
+                let v = mha_leaf(
+                    &mut s,
+                    &vec![0.; batch * keys * 2],
+                    &[batch, keys, 2],
+                    dtype,
+                    true,
+                );
+                let w = mha_leaf(
+                    &mut s,
+                    &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                    &[6, 2],
+                    dtype,
+                    true,
+                );
+                let out_w = mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], dtype, true);
+                let out_b = mha_leaf(&mut s, &[0.5, -0.5], &[2], dtype, true);
+                let mut reference = s.clone();
+                let (output, weights) = s
+                    .multi_head_attention_forward(
+                        q,
+                        k,
+                        v,
+                        w,
+                        None,
+                        out_w,
+                        Some(out_b),
+                        1,
+                        0.5,
+                        None,
+                        None,
+                        need_weights,
+                        true,
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!(s.tensor_shape(output).unwrap(), [batch, queries, 2]);
+                assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                let expected: Vec<f64> = (0..batch * queries).flat_map(|_| [0.5, -0.5]).collect();
+                assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), expected);
+                if let Some(weights) = weights {
+                    assert_eq!(s.tensor_shape(weights).unwrap(), [batch, queries, keys]);
+                    assert!(s.tensor_values_lossy_f64(weights).unwrap().is_empty());
+                } else {
+                    assert!(!need_weights);
+                }
+                let next = s.rand(vec![4], false).unwrap();
+                let expected_next = reference.rand(vec![4], false).unwrap();
+                assert_eq!(
+                    s.tensor_values(next).unwrap(),
+                    reference.tensor_values(expected_next).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_autocast_preserves_f32_parameters_and_exact_weighted_gradients() {
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for dtype in [DType::F16, DType::BF16] {
+            for (need_weights, use_autocast) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let mut s = FrankenTorchSession::new(mode);
+                let q = mha_leaf(&mut s, &[0.; 2], &[1, 1, 2], DType::F32, true);
+                let k = mha_leaf(&mut s, &[0.; 4], &[1, 2, 2], DType::F32, true);
+                let v = mha_leaf(&mut s, &[2., 4., 6., 8.], &[1, 2, 2], DType::F32, true);
+                let in_w = mha_leaf(
+                    &mut s,
+                    &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                    &[6, 2],
+                    DType::F32,
+                    true,
+                );
+                let in_b = mha_leaf(&mut s, &[0.; 6], &[6], DType::F32, true);
+                let out_w = mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], DType::F32, true);
+                let out_b = mha_leaf(&mut s, &[0.5, -0.5], &[2], DType::F32, true);
+                let mask = mha_leaf(&mut s, &[0., f64::NEG_INFINITY], &[1, 2], DType::F32, false);
+                let mut inputs = [q, k, v, in_w, in_b, out_w, out_b];
+                if !use_autocast {
+                    for input in &mut inputs {
+                        *input = s.tensor_to_dtype(*input, dtype).unwrap();
+                    }
+                }
+                let attention = |s: &mut FrankenTorchSession| {
+                    s.functional_multi_head_attention_forward(
+                        inputs[0],
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        Some(inputs[4]),
+                        inputs[5],
+                        Some(inputs[6]),
+                        1,
+                        0.,
+                        Some(mask),
+                        None,
+                        need_weights,
+                        false,
+                        true,
+                    )
+                };
+                let (output, weights) = if use_autocast {
+                    s.with_autocast(dtype, attention)
+                } else {
+                    attention(&mut s)
+                }
+                .unwrap();
+                assert_eq!(s.tensor_shape(output).unwrap(), [1, 1, 2]);
+                assert_eq!(s.tensor_dtype(output).unwrap(), dtype);
+                assert!(s.tensor_requires_grad(output).unwrap());
+                // The mask selects the first value exactly. Identity projections
+                // therefore produce [2, 4] + [0.5, -0.5].
+                assert_eq!(s.tensor_values_lossy_f64(output).unwrap(), [2.5, 3.5]);
+                if need_weights {
+                    let weights = weights.expect("requested attention weights");
+                    assert_eq!(s.tensor_shape(weights).unwrap(), [1, 1, 2]);
+                    assert_eq!(s.tensor_dtype(weights).unwrap(), dtype);
+                    assert_eq!(s.tensor_values_lossy_f64(weights).unwrap(), [1., 0.]);
+                    assert!(s.tensor_requires_grad(weights).unwrap());
+                } else {
+                    assert!(weights.is_none());
+                }
+
+                // dL/doutput = [2, -3]. Only the first value row contributes;
+                // dL/dW is the outer product of that gradient and [2, 4].
+                let loss = weighted_loss(&mut s, output, vec![2., -3.]);
+                let report = s.tensor_backward(loss).unwrap();
+                for (name, node, expected) in [
+                    ("query", q, &[0.; 2][..]),
+                    ("key", k, &[0.; 4][..]),
+                    ("value", v, &[2., -3., 0., 0.][..]),
+                    (
+                        "packed projection weight",
+                        in_w,
+                        &[0., 0., 0., 0., 0., 0., 0., 0., 4., 8., -6., -12.][..],
+                    ),
+                    (
+                        "packed projection bias",
+                        in_b,
+                        &[0., 0., 0., 0., 2., -3.][..],
+                    ),
+                    ("output projection weight", out_w, &[4., 8., -6., -12.][..]),
+                    ("output projection bias", out_b, &[2., -3.][..]),
+                ] {
+                    assert_eq!(
+                        s.tensor_gradient(&report, node).unwrap(),
+                        expected,
+                        "{name}: mode={mode:?}, dtype={dtype:?}, need_weights={need_weights}, use_autocast={use_autocast}"
+                    );
+                }
+                for parameter in [q, k, v, in_w, in_b, out_w, out_b] {
+                    assert_eq!(s.tensor_dtype(parameter).unwrap(), DType::F32);
+                }
+
+                let (inference, inference_weights) = s
+                    .with_no_grad(|s| {
+                        if use_autocast {
+                            s.with_autocast(dtype, attention)
+                        } else {
+                            attention(s)
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(s.tensor_dtype(inference).unwrap(), dtype);
+                assert_eq!(s.tensor_shape(inference).unwrap(), [1, 1, 2]);
+                assert_eq!(s.tensor_values_lossy_f64(inference).unwrap(), [2.5, 3.5]);
+                assert!(!s.tensor_requires_grad(inference).unwrap());
+                if need_weights {
+                    let weights = inference_weights.expect("requested inference weights");
+                    assert_eq!(s.tensor_shape(weights).unwrap(), [1, 1, 2]);
+                    assert_eq!(s.tensor_dtype(weights).unwrap(), dtype);
+                    assert_eq!(s.tensor_values_lossy_f64(weights).unwrap(), [1., 0.]);
+                    assert!(!s.tensor_requires_grad(weights).unwrap());
+                } else {
+                    assert!(inference_weights.is_none());
+                }
+                assert!(s.is_grad_enabled());
+                assert!(!s.is_autocast_enabled());
+            }
+        }
+    }
+}
+
+#[test]
+fn functional_mha_preflight_errors_preserve_tape_rng_and_autocast_state() {
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidInput {
+        Shape(usize, &'static [usize]),
+        DType(usize),
+        Device(usize),
+        Missing(usize),
+        AttentionMaskShape(&'static [usize]),
+        PaddingMaskShape(&'static [usize]),
+        AttentionMaskDType,
+        PaddingMaskDType,
+        AttentionMaskDevice,
+        PaddingMaskDevice,
+        MissingAttentionMask,
+        MissingPaddingMask,
+        Dropout(f64),
+        Heads(usize),
+        ZeroEmbedding,
+    }
+
+    fn zeros(s: &mut FrankenTorchSession, shape: &[usize], dtype: DType) -> TensorNodeId {
+        mha_leaf(s, &vec![0.; shape.iter().product()], shape, dtype, true)
+    }
+
+    fn foreign_device(s: &mut FrankenTorchSession, shape: &[usize]) -> TensorNodeId {
+        // This metadata-only fixture must be rejected before backend execution.
+        let meta =
+            ft_core::TensorMeta::from_shape(shape.to_vec(), DType::F32, ft_core::Device::Cuda);
+        let tensor =
+            ft_core::DenseTensor::from_storage_f32(meta, vec![0.; shape.iter().product()]).unwrap();
+        s.tensor_variable_from_storage(tensor, true)
+    }
+
+    fn missing_node(s: &FrankenTorchSession) -> TensorNodeId {
+        let mut other = s.clone();
+        let absent = other.tensor_variable_f32(vec![0.], vec![1], false).unwrap();
+        assert!(s.tensor_shape(absent).is_err(), "fixture ID must be absent");
+        absent
+    }
+
+    const SHAPES: [&[usize]; 7] = [
+        &[1, 1, 2],
+        &[1, 2, 2],
+        &[1, 2, 2],
+        &[6, 2],
+        &[6],
+        &[2, 2],
+        &[2],
+    ];
+    let mut cases = vec![
+        InvalidInput::Shape(0, &[1, 2]),
+        InvalidInput::Shape(1, &[2, 2]),
+        InvalidInput::Shape(2, &[2, 2]),
+        InvalidInput::Shape(0, &[1, 1, 1, 2]),
+        InvalidInput::Shape(1, &[2, 2, 2]),
+        InvalidInput::Shape(2, &[2, 2, 2]),
+        InvalidInput::Shape(1, &[1, 2, 3]),
+        InvalidInput::Shape(2, &[1, 2, 3]),
+        InvalidInput::Shape(2, &[1, 3, 2]),
+        InvalidInput::Shape(3, &[2, 6]),
+        InvalidInput::Shape(4, &[2, 3]),
+        InvalidInput::Shape(5, &[4, 1]),
+        InvalidInput::Shape(6, &[1, 2]),
+        InvalidInput::AttentionMaskShape(&[2]),
+        InvalidInput::AttentionMaskShape(&[2, 2]),
+        InvalidInput::AttentionMaskShape(&[1, 3]),
+        InvalidInput::AttentionMaskShape(&[2, 1, 2]),
+        InvalidInput::AttentionMaskShape(&[1, 1, 1, 2]),
+        InvalidInput::PaddingMaskShape(&[2]),
+        InvalidInput::PaddingMaskShape(&[2, 2]),
+        InvalidInput::PaddingMaskShape(&[1, 1]),
+        InvalidInput::PaddingMaskShape(&[1, 1, 2]),
+        InvalidInput::AttentionMaskDType,
+        InvalidInput::PaddingMaskDType,
+        InvalidInput::AttentionMaskDevice,
+        InvalidInput::PaddingMaskDevice,
+        InvalidInput::MissingAttentionMask,
+        InvalidInput::MissingPaddingMask,
+        InvalidInput::Dropout(-0.125),
+        InvalidInput::Dropout(1.125),
+        InvalidInput::Dropout(f64::NEG_INFINITY),
+        InvalidInput::Dropout(f64::INFINITY),
+        InvalidInput::Dropout(f64::NAN),
+        InvalidInput::Heads(0),
+        InvalidInput::Heads(3),
+        InvalidInput::ZeroEmbedding,
+    ];
+    for slot in 0..SHAPES.len() {
+        cases.push(InvalidInput::DType(slot));
+        cases.push(InvalidInput::Device(slot));
+        cases.push(InvalidInput::Missing(slot));
+    }
+
+    for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+        for autocast in [None, Some(DType::F16), Some(DType::BF16)] {
+            for need_weights in [false, true] {
+                for case in cases.iter().copied() {
+                    let mut s = FrankenTorchSession::new(mode);
+                    s.manual_seed(0x5eed);
+                    let mut nodes = SHAPES.map(|shape| zeros(&mut s, shape, DType::F32));
+                    nodes[3] = mha_leaf(
+                        &mut s,
+                        &[1., 0., 0., 1., 1., 0., 0., 1., 1., 0., 0., 1.],
+                        &[6, 2],
+                        DType::F32,
+                        true,
+                    );
+                    nodes[5] = mha_leaf(&mut s, &[1., 0., 0., 1.], &[2, 2], DType::F32, true);
+                    let mut attention_mask = None;
+                    let mut padding_mask = None;
+                    let mut dropout = 0.25;
+                    let mut heads = 1;
+                    match case {
+                        InvalidInput::Shape(slot, shape) => {
+                            nodes[slot] = zeros(&mut s, shape, DType::F32);
+                        }
+                        InvalidInput::DType(slot) => {
+                            nodes[slot] = zeros(&mut s, SHAPES[slot], DType::F64);
+                        }
+                        InvalidInput::Device(slot) => {
+                            nodes[slot] = foreign_device(&mut s, SHAPES[slot]);
+                        }
+                        InvalidInput::Missing(slot) => nodes[slot] = missing_node(&s),
+                        InvalidInput::AttentionMaskShape(shape) => {
+                            attention_mask = Some(zeros(&mut s, shape, DType::F32));
+                        }
+                        InvalidInput::PaddingMaskShape(shape) => {
+                            padding_mask = Some(zeros(&mut s, shape, DType::F32));
+                        }
+                        InvalidInput::AttentionMaskDType => {
+                            attention_mask = Some(zeros(&mut s, &[1, 2], DType::F64));
+                        }
+                        InvalidInput::PaddingMaskDType => {
+                            padding_mask = Some(zeros(&mut s, &[1, 2], DType::F64));
+                        }
+                        InvalidInput::AttentionMaskDevice => {
+                            attention_mask = Some(foreign_device(&mut s, &[1, 2]));
+                        }
+                        InvalidInput::PaddingMaskDevice => {
+                            padding_mask = Some(foreign_device(&mut s, &[1, 2]));
+                        }
+                        InvalidInput::MissingAttentionMask => {
+                            attention_mask = Some(missing_node(&s));
+                        }
+                        InvalidInput::MissingPaddingMask => {
+                            padding_mask = Some(missing_node(&s));
+                        }
+                        InvalidInput::Dropout(value) => dropout = value,
+                        InvalidInput::Heads(value) => heads = value,
+                        InvalidInput::ZeroEmbedding => {
+                            for (slot, shape) in [
+                                &[1, 1, 0][..],
+                                &[1, 2, 0][..],
+                                &[1, 2, 0][..],
+                                &[0, 0][..],
+                                &[0][..],
+                                &[0, 0][..],
+                                &[0][..],
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                nodes[slot] = zeros(&mut s, shape, DType::F32);
+                            }
+                        }
+                    }
+
+                    let context = format!(
+                        "mode={mode:?}, autocast={autocast:?}, need_weights={need_weights}, case={case:?}"
+                    );
+                    let before = s.autograd_graph_node_count();
+                    let mut reference = s.clone();
+                    let forward = |s: &mut FrankenTorchSession| {
+                        s.multi_head_attention_forward(
+                            nodes[0],
+                            nodes[1],
+                            nodes[2],
+                            nodes[3],
+                            Some(nodes[4]),
+                            nodes[5],
+                            Some(nodes[6]),
+                            heads,
+                            dropout,
+                            attention_mask,
+                            padding_mask,
+                            need_weights,
+                            false,
+                            true,
+                        )
+                    };
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match autocast {
+                            Some(dtype) => s.with_autocast(dtype, forward),
+                            None => forward(&mut s),
+                        }));
+                    assert!(result.is_ok(), "preflight panicked: {context}");
+                    assert!(
+                        result.unwrap().is_err(),
+                        "invalid input accepted: {context}"
+                    );
+                    assert_eq!(
+                        s.autograd_graph_node_count(),
+                        before,
+                        "tape grew: {context}"
+                    );
+                    assert!(s.is_grad_enabled(), "grad mode changed: {context}");
+                    assert!(!s.is_autocast_enabled(), "autocast leaked: {context}");
+                    let actual_next = s.rand(vec![16], false).unwrap();
+                    let expected_next = reference.rand(vec![16], false).unwrap();
+                    assert_eq!(
+                        s.tensor_values(actual_next).unwrap(),
+                        reference.tensor_values(expected_next).unwrap(),
+                        "RNG advanced: {context}"
+                    );
+                }
+            }
+        }
+    }
+}
