@@ -33869,6 +33869,25 @@ pub fn set_eigh_bt_row_split(on: bool) -> bool {
     EIGH_BT_ROW_SPLIT.swap(on, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Fix the backtransform's arithmetic for one decomposition. Experiments can
+/// pass their own configuration without changing concurrently running kernels.
+#[derive(Clone, Copy)]
+struct EighBacktransformConfig {
+    panel_width: usize,
+    parallel_min: usize,
+    row_split: bool,
+}
+
+impl EighBacktransformConfig {
+    fn current() -> Self {
+        Self {
+            panel_width: EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed),
+            parallel_min: EIGH_BT_PAR_MIN.load(std::sync::atomic::Ordering::Relaxed),
+            row_split: EIGH_BT_ROW_SPLIT.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
 fn eigh_backtransform_project_chunk_f64(
     out: &mut [f64],
     j_base: usize,
@@ -34013,12 +34032,21 @@ fn eigh_backtransform_apply_rows_f64(rows_buf: &mut [f64], proj: &[f64], n: usiz
 }
 
 fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
-    let nb = EIGH_BACKTRANSFORM_NB.load(std::sync::atomic::Ordering::Relaxed);
+    eigh_tred2_backtransform_with_config(n, z, d, EighBacktransformConfig::current());
+}
+
+fn eigh_tred2_backtransform_with_config(
+    n: usize,
+    z: &mut [f64],
+    d: &mut [f64],
+    config: EighBacktransformConfig,
+) {
+    let nb = config.panel_width;
     if nb > 0 {
         eigh_tred2_backtransform_blocked(n, z, d, nb);
         return;
     }
-    let par_min = EIGH_BT_PAR_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    let par_min = config.parallel_min;
     let fast = eigh_fast_kernel();
     let threads = rayon::current_num_threads();
     let mut projections = Vec::with_capacity(n);
@@ -34086,7 +34114,7 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
             // this pair can move time and cannot move a number.
             if i >= par_min && threads > 1 {
                 let prev: &[f64] = previous_rows;
-                if EIGH_BT_ROW_SPLIT.load(std::sync::atomic::Ordering::Relaxed) {
+                if config.row_split {
                     // ROW SPLIT: every thread walks whole rows contiguously, exactly as the
                     // serial loop does, and keeps a private partial. The combine is what
                     // reassociates.
@@ -34165,6 +34193,16 @@ fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
 }
 
 fn eigh_tred2_packed_full(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) -> Vec<f64> {
+    eigh_tred2_packed_full_with_config(n, lower, d, e, EighBacktransformConfig::current())
+}
+
+fn eigh_tred2_packed_full_with_config(
+    n: usize,
+    lower: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+    config: EighBacktransformConfig,
+) -> Vec<f64> {
     let mut scaled_reflectors = vec![0.0f64; lower.len()];
     eigh_tred2_reduce_packed_full(n, lower, &mut scaled_reflectors, d, e);
 
@@ -34177,7 +34215,7 @@ fn eigh_tred2_packed_full(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
             z[j * n + i] = scaled_reflectors[lower_packed_index(i, j)];
         }
     }
-    eigh_tred2_backtransform(n, &mut z, d);
+    eigh_tred2_backtransform_with_config(n, &mut z, d, config);
     z
 }
 
@@ -35742,6 +35780,14 @@ pub fn eigh_batched_contiguous_f64(
 }
 
 pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult, KernelError> {
+    eigh_contiguous_f64_with_backtransform(data, meta, EighBacktransformConfig::current())
+}
+
+fn eigh_contiguous_f64_with_backtransform(
+    data: &[f64],
+    meta: &TensorMeta,
+    backtransform: EighBacktransformConfig,
+) -> Result<EighResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
     if shape.len() != 2 || shape[0] != shape[1] {
@@ -35775,7 +35821,7 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     }
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
-    let mut z = eigh_tred2_packed_full(n, &mut lower, &mut d, &mut e);
+    let mut z = eigh_tred2_packed_full_with_config(n, &mut lower, &mut d, &mut e, backtransform);
     // QL eigenvector iteration on the NON-transposed Z via deferred whole-stream
     // replay (rotation mixes adjacent columns i,i+1 → contiguous, row-parallel).
     // frankentorch-kgs4.73.
@@ -39849,6 +39895,103 @@ mod bidiag {
         if alpha < 0.0 { -1.0 } else { 1.0 }
     }
 
+    /// Exact round-to-nearest overflow decision when `hi` is in the top finite binade.
+    ///
+    /// The rounding boundary is T = (2^54 - 1) * 2^970, and hi = mh * 2^971.
+    /// After subtracting hi^2, compare lo^2 with R * 2^1940, where
+    /// R = (2^54 - 1)^2 - (2*mh)^2. These significand squares fit in u128.
+    /// Shifting lo's square right avoids overflowing R when the exponents differ.
+    fn house_hypot_overflows_f64(hi: f64, lo: f64) -> bool {
+        const FRACTION_MASK: u64 = 0x000f_ffff_ffff_ffff;
+        let hi_significand = u128::from((hi.to_bits() & FRACTION_MASK) | (1 << 52));
+        let boundary = (1u128 << 54) - 1;
+        let remainder = boundary * boundary - ((hi_significand * hi_significand) << 2);
+        let lo_bits = lo.to_bits();
+        let lo_exponent = (lo_bits >> 52) as u32;
+        let lo_significand = u128::from((lo_bits & FRACTION_MASK) | (1 << 52));
+        let lo_square = lo_significand * lo_significand;
+        if lo_exponent == 2046 {
+            (lo_square << 2) >= remainder
+        } else {
+            // A subnormal lo also returns false: its shift is far beyond 128.
+            let shift = 2 * (2045 - lo_exponent);
+            lo_square.checked_shr(shift).unwrap_or(0) >= remainder
+        }
+    }
+
+    /// Reproducible two-component norm for the Householder generator.
+    ///
+    /// `f64::hypot` delegates to the platform math library, whose fused and unfused
+    /// implementations can round differently. Those differences propagate through every
+    /// subsequent reflector; they changed all five blocked-reduction goldens on CI even
+    /// though the panel arithmetic itself had not changed.
+    ///
+    /// Use the differential correction from Borges, "An Improved Algorithm for
+    /// hypot(a,b)", section 4.2, Algorithm 4: <https://arxiv.org/abs/1904.09481>.
+    /// For the initial norm `h`, evaluate the residual `h*h - hi*hi - lo*lo`
+    /// without subtracting the large squares, then subtract `residual / (2*h)`.
+    /// Keep the indicated grouping and separate multiply/add operations: introducing
+    /// `mul_add` changes the arithmetic contract pinned by the existing goldens.
+    fn house_hypot_f64(x: f64, y: f64) -> f64 {
+        if x.is_infinite() || y.is_infinite() {
+            return f64::INFINITY;
+        }
+        if x.is_nan() || y.is_nan() {
+            return f64::NAN;
+        }
+
+        let mut hi = x.abs().max(y.abs());
+        let mut lo = x.abs().min(y.abs());
+        // Below this conservative ratio the smaller component cannot affect the norm.
+        // This also handles both signed zeros and avoids scaling a negligible operand.
+        const SMALL_RATIO: f64 = f64::from_bits(0x3c90_0000_0000_0000); // 2^-54
+        if lo <= hi * SMALL_RATIO {
+            return hi;
+        }
+        // An approximation within one ULP can still choose the wrong side of the
+        // MAX/infinity boundary. Decide that classification with exact integers first.
+        let top_binade = hi.to_bits() >> 52 == 2046;
+        if top_binade && house_hypot_overflows_f64(hi, lo) {
+            return f64::INFINITY;
+        }
+
+        // Exact powers of two keep both the squares and the correction in normal range.
+        // The ratio check prevents a tiny `lo` and a huge `hi` reaching the up-scale
+        // together. Even the smallest subnormal becomes 2^-474 after up-scaling.
+        const HIGH: f64 = f64::from_bits(0x5fe0_0000_0000_0000); // 2^511
+        const LOW: f64 = f64::from_bits(0x2340_0000_0000_0000); // 2^-459
+        const SCALE_UP: f64 = f64::from_bits(0x6570_0000_0000_0000); // 2^600
+        const SCALE_DOWN: f64 = f64::from_bits(0x1a70_0000_0000_0000); // 2^-600
+        let scale = if hi > HIGH {
+            SCALE_DOWN
+        } else if lo < LOW {
+            SCALE_UP
+        } else {
+            1.0
+        };
+        hi *= scale;
+        lo *= scale;
+
+        let h = (hi * hi + lo * lo).sqrt();
+        let (large_term, small_term) = if h <= 2.0 * lo {
+            let delta = h - lo;
+            (hi * (2.0 * delta - hi), (delta - 2.0 * (hi - lo)) * delta)
+        } else {
+            let delta = h - hi;
+            (
+                2.0 * delta * (hi - 2.0 * lo),
+                (4.0 * delta - lo) * lo + delta * delta,
+            )
+        };
+        let norm = (h - (large_term + small_term) / (2.0 * h)) / scale;
+        if top_binade && norm.is_infinite() {
+            // The exact comparison above proved that the rounded norm is finite.
+            f64::MAX
+        } else {
+            norm
+        }
+    }
+
     /// `dlarfg`: generate a Householder reflector over a strided vector.
     ///
     /// The vector starts at `a[start]` and advances by `stride` for `len` entries.
@@ -39904,7 +40047,7 @@ mod bidiag {
             if tail_sq == 0.0 {
                 return 0.0;
             }
-            let beta = -house_sign_f64(alpha) * alpha.hypot(tail_sq.sqrt());
+            let beta = -house_sign_f64(alpha) * house_hypot_f64(alpha, tail_sq.sqrt());
             let tau = (beta - alpha) / beta;
             let inv = 1.0 / (alpha - beta);
             for k in 1..len {
@@ -39935,7 +40078,7 @@ mod bidiag {
         if tail_sq == 0.0 {
             return 0.0;
         }
-        let beta_s = -house_sign_f64(alpha_s) * alpha_s.hypot(tail_sq.sqrt());
+        let beta_s = -house_sign_f64(alpha_s) * house_hypot_f64(alpha_s, tail_sq.sqrt());
         // `tau` and `v` are both scale-INVARIANT — tau is a ratio of two scaled
         // quantities and v is the tail divided by a scaled quantity — so only `beta` has
         // to come back down, and dividing by a power of two is exact.
@@ -40878,7 +41021,145 @@ mod bidiag {
 
     #[cfg(test)]
     mod i3nqm_house_gen_tests {
-        use super::house_gen_strided_f64;
+        use super::{house_gen_strided_f64, house_hypot_f64};
+
+        #[test]
+        fn bidiag_house_hypot_special_values_and_exact_scaled_norms() {
+            for x in [0.0f64, -0.0] {
+                for y in [0.0f64, -0.0] {
+                    assert_eq!(house_hypot_f64(x, y).to_bits(), 0.0f64.to_bits());
+                }
+            }
+            for x in [f64::INFINITY, f64::NEG_INFINITY] {
+                for y in [0.0f64, -0.0, 1.0, f64::MAX, f64::NAN, x, -x] {
+                    assert_eq!(house_hypot_f64(x, y), f64::INFINITY);
+                    assert_eq!(house_hypot_f64(y, x), f64::INFINITY);
+                }
+            }
+            for x in [0.0f64, -0.0, 1.0, -1.0, f64::MAX, f64::NAN] {
+                assert!(house_hypot_f64(x, f64::NAN).is_nan());
+                assert!(house_hypot_f64(f64::NAN, x).is_nan());
+            }
+
+            // These expectations are exact Pythagorean triples, independent of a math
+            // library's hypot. Include subnormal values and both scaling boundaries.
+            for exponent in [
+                -1074i32, -1073, -1023, -1022, -600, -512, -460, -459, -458, -1, 0, 1, 510, 511,
+                512, 600, 1020, 1021,
+            ] {
+                let scale = if exponent < -1022 {
+                    f64::from_bits(1 << (exponent + 1074))
+                } else {
+                    f64::from_bits(((exponent + 1023) as u64) << 52)
+                };
+                let want = 5.0 * scale;
+                assert!(want.is_finite() && want > 0.0);
+                for x_sign in [-1.0, 1.0] {
+                    for y_sign in [-1.0, 1.0] {
+                        let x = x_sign * 3.0 * scale;
+                        let y = y_sign * 4.0 * scale;
+                        assert_eq!(
+                            house_hypot_f64(x, y).to_bits(),
+                            want.to_bits(),
+                            "3-4-5 norm at exponent {exponent}, x={x:e}, y={y:e}"
+                        );
+                        assert_eq!(house_hypot_f64(y, x).to_bits(), want.to_bits());
+                        assert_eq!(house_hypot_f64(x, -0.0).to_bits(), x.abs().to_bits());
+                    }
+                }
+            }
+            assert_eq!(house_hypot_f64(f64::MAX, f64::MAX), f64::INFINITY);
+            assert_eq!(
+                house_hypot_f64(f64::MAX, f64::from_bits(1)).to_bits(),
+                f64::MAX.to_bits()
+            );
+            // The ratio threshold itself can underflow upward to the smallest subnormal.
+            // Adding that insignificant lo to an odd significand would change the answer.
+            let dominant = f64::from_bits(0x0020_0000_0000_0001);
+            assert_eq!(
+                house_hypot_f64(dominant, f64::from_bits(1)).to_bits(),
+                dominant.to_bits()
+            );
+        }
+
+        #[test]
+        fn bidiag_house_hypot_matches_high_precision_boundary_oracle() {
+            // Independent oracle: Decimal.from_float for each operand, sum of squares
+            // and sqrt at 2500 decimal digits, then rounded to binary64. The inputs are
+            // stored as bits so parsing decimal literals cannot move a boundary. No libc
+            // hypot or copy of the correction algorithm participates in the expectations.
+            // Keep each input pair and its expected result together for fixture review.
+            #[rustfmt::skip]
+            let cases: &[(u64, u64, u64)] = &[
+                (0x3ff0_0000_0000_0000, 0x3ff0_0000_0000_0000, 0x3ff6_a09e_667f_3bcd),
+                (0x4008_0000_0000_0000, 0x4010_0000_0000_0000, 0x4014_0000_0000_0000),
+                (0x4014_0000_0000_0000, 0x4028_0000_0000_0000, 0x402a_0000_0000_0000),
+                // Adjacent values below, at and above the large/small scaling gates.
+                (0x5fdf_ffff_ffff_ffff, 0x5fd0_0000_0000_0000, 0x5fe1_e377_9b97_f4a7),
+                (0x5fe0_0000_0000_0000, 0x5fd0_0000_0000_0000, 0x5fe1_e377_9b97_f4a8),
+                (0x5fe0_0000_0000_0001, 0x5fd0_0000_0000_0000, 0x5fe1_e377_9b97_f4a9),
+                (0x2350_0000_0000_0000, 0x233f_ffff_ffff_ffff, 0x2351_e377_9b97_f4a8),
+                (0x2350_0000_0000_0000, 0x2340_0000_0000_0000, 0x2351_e377_9b97_f4a8),
+                (0x2350_0000_0000_0000, 0x2340_0000_0000_0001, 0x2351_e377_9b97_f4a8),
+                // The correction switches formula at h == 2*lo (hi near sqrt(3)).
+                (0x3ffb_b67a_e858_4ca9, 0x3ff0_0000_0000_0000, 0x3fff_ffff_ffff_ffff),
+                (0x3ffb_b67a_e858_4caa, 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000),
+                (0x3ffb_b67a_e858_4cab, 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000),
+                // The dominance gate and the distinct half-ULP norm boundary.
+                (0x3ff0_0000_0000_0000, 0x3c8f_ffff_ffff_ffff, 0x3ff0_0000_0000_0000),
+                (0x3ff0_0000_0000_0000, 0x3c90_0000_0000_0000, 0x3ff0_0000_0000_0000),
+                (0x3ff0_0000_0000_0000, 0x3c90_0000_0000_0001, 0x3ff0_0000_0000_0000),
+                (0x3ff0_0000_0000_0000, 0x3e4f_ffff_ffff_ffff, 0x3ff0_0000_0000_0000),
+                (0x3ff0_0000_0000_0000, 0x3e50_0000_0000_0000, 0x3ff0_0000_0000_0000),
+                (0x3ff0_0000_0000_0000, 0x3e50_0000_0000_0001, 0x3ff0_0000_0000_0001),
+                // Subnormals, the smallest normal value, and their boundary.
+                (0x0000_0000_0000_0001, 0x0000_0000_0000_0001, 0x0000_0000_0000_0001),
+                (0x0000_0000_0000_0003, 0x0000_0000_0000_0004, 0x0000_0000_0000_0005),
+                (0x0010_0000_0000_0000, 0x0010_0000_0000_0000, 0x0016_a09e_667f_3bcd),
+                (0x000f_ffff_ffff_ffff, 0x000f_ffff_ffff_ffff, 0x0016_a09e_667f_3bcb),
+                (0x0010_0000_0000_0000, 0x0000_0000_0000_0001, 0x0010_0000_0000_0000),
+                (0x0010_0000_0000_0000, 0x000f_ffff_ffff_ffff, 0x0016_a09e_667f_3bcc),
+                // Overflow is required only when the rounded mathematical norm overflows.
+                (0x7fef_ffff_ffff_ffff, 0x0000_0000_0000_0000, 0x7fef_ffff_ffff_ffff),
+                (0x7fef_ffff_ffff_ffff, 0x7e40_0000_0000_0000, 0x7fef_ffff_ffff_ffff),
+                (0x7fef_ffff_ffff_ffff, 0x7e50_0000_0000_0000, 0x7ff0_0000_0000_0000),
+                (0x7fef_ffff_ffff_ffff, 0x7fef_ffff_ffff_ffff, 0x7ff0_0000_0000_0000),
+                (0x7fef_ffff_ffff_ffff, 0x7e46_a09e_667f_3bcb, 0x7fef_ffff_ffff_ffff),
+                (0x7fef_ffff_ffff_ffff, 0x7e46_a09e_667f_3bcc, 0x7fef_ffff_ffff_ffff),
+                (0x7fef_ffff_ffff_ffff, 0x7e46_a09e_667f_3bcd, 0x7ff0_0000_0000_0000),
+                (0x405e_dd2f_1a9f_be77, 0x4088_a8fb_e76c_8b44, 0x4088_f5c6_3846_4f15),
+                (0x3fef_ffff_ffff_ffff, 0x3ff0_0000_0000_0001, 0x3ff6_a09e_667f_3bcd),
+                (0x7fef_ffff_ffff_ffff, 0x0000_0000_0000_0001, 0x7fef_ffff_ffff_ffff),
+                (0x20b0_0000_0000_0000, 0x0170_0000_0000_0000, 0x20b0_0000_0000_0000),
+                (0x5f30_0000_0000_0000, 0x3ff0_0000_0000_0000, 0x5f30_0000_0000_0000),
+                // Regressions found by an independent sweep, including two legitimate
+                // one-ULP finite errors that exercise the budget rather than exact equality.
+                (0x0020_0000_0000_0001, 0x0000_0000_0000_0001, 0x0020_0000_0000_0001),
+                (0x7fef_ffff_ffff_fffe, 0x7e53_988e_1409_212e, 0x7fef_ffff_ffff_ffff),
+                (0x491c_3974_6334_776a, 0x491c_3a35_371d_cfa6, 0x4923_f56f_2d75_cb3a),
+                (0x0008_56be_7035_3b4c, 0x0000_130a_a1d6_f800, 0x0008_56d4_2da5_2935),
+            ];
+            for &(x_bits, y_bits, want_bits) in cases {
+                let x = f64::from_bits(x_bits);
+                let y = f64::from_bits(y_bits);
+                let want = f64::from_bits(want_bits);
+                for (x, y) in [(x, y), (y, x), (-x, y), (x, -y), (-x, -y)] {
+                    let got = house_hypot_f64(x, y);
+                    if want.is_infinite() {
+                        assert_eq!(got, want, "overflow at x={x:e}, y={y:e}");
+                    } else {
+                        // MAX/infinity and zero/min-subnormal are adjacent bit patterns;
+                        // a ULP-distance check alone cannot guard those classifications.
+                        assert!(got.is_finite() && got.is_sign_positive() && got > 0.0);
+                        let ulps = got.to_bits().abs_diff(want_bits);
+                        assert!(
+                            ulps <= 1,
+                            "norm x={x:e}, y={y:e}: got {got:e}, want {want:e}, {ulps} ULP"
+                        );
+                    }
+                }
+            }
+        }
 
         /// `frankentorch-i3nqm`: the Householder generator at the scales its own bead named.
         ///
@@ -75747,15 +76028,6 @@ mod tests {
         }
     }
 
-    /// Serialises the two backtransform tests against each other.
-    ///
-    /// They share `EIGH_BT_ROW_SPLIT`, and unlike this file's other flag pairs the two paths are
-    /// NOT the same arithmetic: the row split reassociates on purpose. So a concurrent run of the
-    /// row-split test flips the global out from under `eigh_backtransform_parallel_is_bit_exact`
-    /// and its `to_bits()` comparison fails — which is exactly what happened, and it is a test
-    /// isolation defect rather than a kernel one. Both tests take this lock.
-    static EIGH_BT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The ROW-SPLIT backtransform projection against the serial one — TOLERANCE, `wjrqt`.
     ///
     /// Unlike the column-split (which is bit-exact and was measured a REJECT at 0.925x), the row
@@ -75765,7 +76037,6 @@ mod tests {
     /// catch a wrong eigenvector and a magnitude check would not catch a sign flip.
     #[test]
     fn eigh_backtransform_row_split_matches_serial() {
-        let _guard = EIGH_BT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let n = 200usize;
         let mut a = vec![0.0f64; n * n];
         for i in 0..n {
@@ -75777,14 +76048,29 @@ mod tests {
             }
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
-        let prev_min = super::set_eigh_bt_par_min(usize::MAX);
-        let prev_split = super::set_eigh_bt_row_split(false);
-        let serial = super::eigh_contiguous_f64(&a, &meta).unwrap();
-        super::set_eigh_bt_par_min(64);
-        super::set_eigh_bt_row_split(true);
-        let forked = super::eigh_contiguous_f64(&a, &meta).unwrap();
-        super::set_eigh_bt_par_min(prev_min);
-        super::set_eigh_bt_row_split(prev_split);
+        let serial_config = super::EighBacktransformConfig {
+            panel_width: 0,
+            parallel_min: usize::MAX,
+            row_split: false,
+        };
+        let split_config = super::EighBacktransformConfig {
+            parallel_min: 64,
+            row_split: true,
+            ..serial_config
+        };
+        // Run distinct arithmetic concurrently without mutating the process-wide
+        // controls used by other eigensolver tests. Four workers guarantee that
+        // the row-split arm executes even when the ambient pool has one thread.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("eigh test pool");
+        let (serial, forked) = pool.install(|| {
+            rayon::join(
+                || super::eigh_contiguous_f64_with_backtransform(&a, &meta, serial_config).unwrap(),
+                || super::eigh_contiguous_f64_with_backtransform(&a, &meta, split_config).unwrap(),
+            )
+        });
 
         let scale = serial
             .eigenvalues
@@ -75831,13 +76117,10 @@ mod tests {
     /// eigenvalues alone would not see a wrong eigenvector, and a magnitude comparison would not
     /// see a sign flip (the trap that hid a reflector defect for a whole family, kzq2y).
     ///
-    /// n = 200 with a threshold of 64 so the fork actually fires for most steps; the global is
-    /// restored afterwards, and a concurrent test that races it still gets a correct answer
-    /// because the two paths are the same arithmetic.
+    /// n = 200 with a threshold of 64 and a local four-thread pool so the fork
+    /// actually fires. Each concurrent decomposition owns its configuration.
     #[test]
     fn eigh_backtransform_parallel_is_bit_exact() {
-        let _guard = EIGH_BT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let previous_split = super::set_eigh_bt_row_split(false);
         let n = 200usize;
         let mut a = vec![0.0f64; n * n];
         for i in 0..n {
@@ -75849,12 +76132,28 @@ mod tests {
             }
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
-        let previous = super::set_eigh_bt_par_min(usize::MAX);
-        let serial = super::eigh_contiguous_f64(&a, &meta).unwrap();
-        super::set_eigh_bt_par_min(64);
-        let forked = super::eigh_contiguous_f64(&a, &meta).unwrap();
-        super::set_eigh_bt_par_min(previous);
-        super::set_eigh_bt_row_split(previous_split);
+        let serial_config = super::EighBacktransformConfig {
+            panel_width: 0,
+            parallel_min: usize::MAX,
+            row_split: false,
+        };
+        let parallel_config = super::EighBacktransformConfig {
+            parallel_min: 64,
+            ..serial_config
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("eigh test pool");
+        let (serial, forked) = pool.install(|| {
+            rayon::join(
+                || super::eigh_contiguous_f64_with_backtransform(&a, &meta, serial_config).unwrap(),
+                || {
+                    super::eigh_contiguous_f64_with_backtransform(&a, &meta, parallel_config)
+                        .unwrap()
+                },
+            )
+        });
         for i in 0..n {
             assert_eq!(
                 serial.eigenvalues[i].to_bits(),

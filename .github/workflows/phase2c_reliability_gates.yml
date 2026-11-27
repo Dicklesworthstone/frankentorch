@@ -127,9 +127,12 @@ jobs:
           # stable and nightly. Native ARM also exercises its NEON implementation.
           cargo +"$RUST_TOOLCHAIN" test --locked -j2 \
             -p frankentorch-kernel-cpu "${simd_flags[@]}"
-          # Check optimized floating-point behavior and architecture dispatch too.
+          # Check optimized pooling, signed-zero ties, deterministic Householder
+          # norms, and concurrent eigensolver configurations as well.
           cargo +"$RUST_TOOLCHAIN" test --locked --release -j2 \
-            -p frankentorch-kernel-cpu "${simd_flags[@]}" --lib avg_pool2d_
+            -p frankentorch-kernel-cpu "${simd_flags[@]}" --lib -- \
+            avg_pool2d_ min_max_ bidiag \
+            eigh_fast_kernel_matches_shipped_bitwise eigh_backtransform_
           cargo +"$RUST_TOOLCHAIN" test --locked --release -j2 \
             -p frankentorch-kernel-cpu "${simd_flags[@]}" --test dynamic_int8_exact
           if [[ $(uname -m) == aarch64 ]]; then
