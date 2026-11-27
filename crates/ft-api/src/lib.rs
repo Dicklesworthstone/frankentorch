@@ -1413,6 +1413,17 @@ impl FrankenTorchSession {
         self.runtime.set_mode(mode);
     }
 
+    /// Restart this session's random stream from `seed`.
+    ///
+    /// Repeating a seed and the same sequence of random operations reproduces
+    /// their values, including random tensor factories, parameter initialization,
+    /// and dropout. Every `u64` seed is accepted; new sessions use seed 42.
+    /// Existing tensors, the autograd graph, and other sessions are unchanged.
+    /// The stream uses xoshiro256++, so its values differ from PyTorch's generator.
+    pub fn manual_seed(&mut self, seed: u64) {
+        self.rng = Xoshiro256PlusPlus::new(seed);
+    }
+
     // Gamma sampling now lives on the RNG as `Xoshiro256PlusPlus::next_gamma` (bit-identical
     // Marsaglia-Tsang), so the distribution samplers can call it inside per-element
     // sub-streams for parallelism (see `substream_sample`).
@@ -111996,6 +112007,88 @@ mod tests {
     }
 
     #[test]
+    fn manual_seed_replays_mixed_random_factories() {
+        let draw = |session: &mut FrankenTorchSession| {
+            let tensors = [
+                session.rand(vec![7], false).unwrap(),
+                session.randn(vec![9], false).unwrap(),
+                session.randn_f32(vec![5], false).unwrap(),
+                session.rand(vec![3], false).unwrap(),
+            ];
+            tensors.map(|tensor| {
+                session
+                    .tensor_values_lossy_f64(tensor)
+                    .unwrap()
+                    .into_iter()
+                    .map(f64::to_bits)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let default_values = draw(&mut session);
+            session.manual_seed(42);
+            assert_eq!(draw(&mut session), default_values);
+
+            for seed in [0, 42, 111, u64::MAX] {
+                session.manual_seed(seed);
+                let first = draw(&mut session);
+                assert_ne!(draw(&mut session), first, "the stream must advance");
+                session.manual_seed(seed);
+                assert_eq!(draw(&mut session), first, "seed {seed} must replay");
+            }
+
+            session.manual_seed(111);
+            let first_seed = draw(&mut session);
+            session.manual_seed(222);
+            assert_ne!(draw(&mut session), first_seed);
+        }
+    }
+
+    #[test]
+    fn manual_seed_preserves_graph_and_other_sessions() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            let input = session
+                .tensor_variable(vec![1.0, -2.0], vec![2], true)
+                .unwrap();
+            let square = session.tensor_mul(input, input).unwrap();
+            let loss = session.tensor_sum(square).unwrap();
+            session.rand(vec![3], false).unwrap();
+            let mut untouched = session.clone();
+            let mut reference = untouched.clone();
+            let nodes = session.autograd_graph_node_count();
+
+            session.with_no_grad(|session| {
+                session.manual_seed(111);
+                assert!(!session.is_grad_enabled());
+                assert_eq!(session.mode(), mode);
+                assert_eq!(session.autograd_graph_node_count(), nodes);
+            });
+            assert!(session.is_grad_enabled());
+            assert_eq!(session.tensor_values(input).unwrap(), [1.0, -2.0]);
+            let report = session.tensor_backward(loss).unwrap();
+            assert_eq!(
+                session.tensor_gradient(&report, input).unwrap(),
+                [2.0, -4.0]
+            );
+
+            let actual = untouched.rand(vec![8], false).unwrap();
+            let expected = reference.rand(vec![8], false).unwrap();
+            assert_eq!(
+                untouched.tensor_values(actual).unwrap(),
+                reference.tensor_values(expected).unwrap()
+            );
+            let reseeded = session.rand(vec![8], false).unwrap();
+            assert_ne!(
+                session.tensor_values(reseeded).unwrap(),
+                untouched.tensor_values(actual).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn rand_creates_uniform_values() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let t = s.rand(vec![100], false).unwrap();
@@ -149098,7 +149191,7 @@ mod tests {
             for dtype in [DType::F32, DType::F64] {
                 for p in [0.25_f64, 0.65] {
                     let mut s = FrankenTorchSession::new(mode);
-                    s.rng = super::Xoshiro256PlusPlus::new(314);
+                    s.manual_seed(314);
                     let shape = vec![2, 3, 4];
                     let values: Vec<f64> = (0..24).map(|i| (i as f64 - 12.0) / 4.0).collect();
                     let input = s.tensor_variable_from_storage(
@@ -149194,7 +149287,7 @@ mod tests {
                         _ => FrankenTorchSession::functional_dropout3d,
                     };
                     let mut s = FrankenTorchSession::new(mode);
-                    s.rng = super::Xoshiro256PlusPlus::new(314);
+                    s.manual_seed(314);
                     let mut shape = vec![2, 4];
                     shape.extend(std::iter::repeat_n(2, spatial_dims));
                     let spatial = 1usize << spatial_dims;
@@ -174862,7 +174955,7 @@ mod tests {
     #[test]
     fn checkpoint_replays_dropout_rng_without_advancing_parent_again() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        s.rng = super::Xoshiro256PlusPlus::new(1729);
+        s.manual_seed(1729);
         s.rand(vec![7], false).unwrap();
         let x = s.tensor_variable(vec![1.0; 16], vec![16], true).unwrap();
         let mut reference = s.clone();
@@ -178589,8 +178682,8 @@ mod tests {
         for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
             let mut s = FrankenTorchSession::new(mode);
             let mut reference = FrankenTorchSession::new(mode);
-            s.rng = super::Xoshiro256PlusPlus::new(1729);
-            reference.rng = super::Xoshiro256PlusPlus::new(1729);
+            s.manual_seed(1729);
+            reference.manual_seed(1729);
             let mask = reference.tensor_rand(vec![3], false).unwrap();
             let mask = reference.tensor_values(mask).unwrap();
             let x = s
