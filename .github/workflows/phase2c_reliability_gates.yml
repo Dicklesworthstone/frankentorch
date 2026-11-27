@@ -165,11 +165,14 @@ jobs:
         with:
           shared-key: training-semantics
 
-      - name: Complex, phase, and typed training regressions
-        run: cargo test -j 1 -p frankentorch-api --test complex_fft_autograd_parity --test autocast_training
+      - name: Complex, contraction, and typed training regressions
+        run: >-
+          cargo test -j 1 -p frankentorch-api
+          --test complex_fft_autograd_parity --test autocast_training
+          --test einsum_training_parity
 
-      - name: BatchNorm training and checkpoint regressions
-        run: cargo test -j 1 -p ft-nn --lib batchnorm_
+      - name: BatchNorm and Bilinear training regressions
+        run: cargo test -j 1 -p ft-nn --lib -- batchnorm_ tests::bilinear_
 
   gate-topology:
     name: G1..G8 gate topology

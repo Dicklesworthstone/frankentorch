@@ -31716,12 +31716,19 @@ impl FrankenTorchSession {
         }
     }
 
-    /// Bilinear transformation: `y[k] = x1 @ W[k] @ x2^T + b[k]`.
+    /// Bilinear transformation: `y[..., o] = sum(i, j, x1[..., i] * W[o, i, j] * x2[..., j]) + b[o]`.
     ///
     /// Equivalent to `torch.nn.functional.bilinear(input1, input2, weight, bias)`.
-    /// `input1`: `[*, in1_features]`, `input2`: `[*, in2_features]`,
-    /// `weight`: `[out_features, in1_features, in2_features]`,
-    /// `bias` (optional): `[out_features]`.
+    /// Inputs have shapes `[*, in1_features]` and `[*, in2_features]` with
+    /// identical leading dimensions. Weight has shape
+    /// `[out_features, in1_features, in2_features]`; optional bias has shape
+    /// `[out_features]`. The output has shape `[*, out_features]`.
+    ///
+    /// All tensors must have the same real floating dtype and device. CPU
+    /// autocast does not change this operation's dtype. Each F16/BF16
+    /// contraction accumulates in F32 and rounds back to the input dtype
+    /// before the next operation. Empty batch and output-feature dimensions
+    /// are supported; both input-feature dimensions must be positive.
     pub fn functional_bilinear(
         &mut self,
         input1: TensorNodeId,
@@ -31729,35 +31736,110 @@ impl FrankenTorchSession {
         weight: TensorNodeId,
         bias: Option<TensorNodeId>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let weight_shape = self.tensor_shape(weight)?;
-        if weight_shape.len() != 3 {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "bilinear: weight must be 3-D [out_features, in1_features, in2_features]",
-                },
-            )));
-        }
-        let out_features = weight_shape[0];
         let input1_shape = self.tensor_shape(input1)?;
-        let batch_shape: Vec<usize> = input1_shape[..input1_shape.len() - 1].to_vec();
-        let mut output_parts = Vec::with_capacity(out_features);
-        for k in 0..out_features {
-            let w_k = self.tensor_select(weight, 0, k)?;
-            let temp = self.tensor_matmul(input1, w_k)?;
-            let input2_t =
-                self.tensor_transpose(input2, input1_shape.len() - 1, input1_shape.len() - 1)?;
-            let out_k = self.tensor_matmul(temp, input2_t)?;
-            output_parts.push(out_k);
+        let input2_shape = self.tensor_shape(input2)?;
+        if input1_shape.is_empty() || input2_shape.is_empty() {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: inputs must be at least 1-D",
+            ));
         }
-        let output = self.tensor_stack(&output_parts, batch_shape.len())?;
-        match bias {
-            Some(b) => {
-                let out_shape = self.tensor_shape(output)?;
-                let expanded = self.tensor_expand(b, out_shape)?;
-                self.tensor_add(output, expanded)
+        let leading = &input1_shape[..input1_shape.len() - 1];
+        if leading != &input2_shape[..input2_shape.len() - 1] {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: input batch dimensions must match",
+            ));
+        }
+        let weight_shape = self.tensor_shape(weight)?;
+        let [out_features, in1_features, in2_features] = weight_shape.as_slice() else {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: weight must be 3-D [out_features, in1_features, in2_features]",
+            ));
+        };
+        let (out_features, in1_features, in2_features) =
+            (*out_features, *in1_features, *in2_features);
+        if in1_features == 0 || in2_features == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: input feature dimensions must be positive",
+            ));
+        }
+        if input1_shape[input1_shape.len() - 1] != in1_features
+            || input2_shape[input2_shape.len() - 1] != in2_features
+        {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: input feature dimensions mismatch",
+            ));
+        }
+        if let Some(bias) = bias
+            && self.tensor_shape(bias)? != [out_features]
+        {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: bias must have shape [out_features]",
+            ));
+        }
+        let dtype = self.tensor_dtype(input1)?;
+        let device = self.tensor_device(input1)?;
+        if !dtype.is_floating_point() {
+            return Err(Self::incompatible_tensor_args(
+                "bilinear: inputs and parameters must use real floating dtypes",
+            ));
+        }
+        for tensor in [input2, weight].into_iter().chain(bias) {
+            if self.tensor_dtype(tensor)? != dtype {
+                return Err(Self::incompatible_tensor_args(
+                    "bilinear: inputs and parameters must have the same dtype",
+                ));
             }
-            None => Ok(output),
+            if self.tensor_device(tensor)? != device {
+                return Err(Self::incompatible_tensor_args(
+                    "bilinear: inputs and parameters must be on the same device",
+                ));
+            }
         }
+        let batch = Self::checked_shape_numel(leading, "bilinear: batch shape overflow")?;
+        let features = Self::checked_mul(
+            in1_features,
+            in2_features,
+            "bilinear: feature size overflow",
+        )?;
+        let projected_features = Self::checked_mul(
+            out_features,
+            in2_features,
+            "bilinear: projected feature size overflow",
+        )?;
+        Self::checked_mul(out_features, features, "bilinear: weight shape overflow")?;
+        Self::checked_mul(
+            batch,
+            projected_features,
+            "bilinear: intermediate shape overflow",
+        )?;
+        Self::checked_mul(batch, out_features, "bilinear: output shape overflow")?;
+        let mut output_shape = leading.to_vec();
+        output_shape.push(out_features);
+
+        // Bilinear is not a CPU autocast-eligible operation. Validate raw
+        // dtypes before composing its two contractions, and keep the internal
+        // linear/BMM primitives from changing that public dtype contract.
+        self.with_autocast_disabled(|session| {
+            let x1 = session.tensor_reshape(input1, vec![batch, in1_features])?;
+            let x2 = session.tensor_reshape(input2, vec![batch, in2_features, 1])?;
+            let weight = session.tensor_permute(weight, vec![0, 2, 1])?;
+            let weight = session.tensor_reshape(weight, vec![projected_features, in1_features])?;
+            // Contract x1 with W first: forming x1*x2 before multiplying W
+            // can overflow even when both native contractions are finite.
+            let projected = session.functional_linear(x1, weight, None)?;
+            let projected =
+                session.tensor_reshape(projected, vec![batch, out_features, in2_features])?;
+            let output = session.tensor_bmm(projected, x2)?;
+            let output = session.tensor_reshape(output, vec![batch, out_features])?;
+            let output = if let Some(bias) = bias {
+                let bias = session.tensor_reshape(bias, vec![1, out_features])?;
+                let bias = session.tensor_expand(bias, vec![batch, out_features])?;
+                session.tensor_add(output, bias)?
+            } else {
+                output
+            };
+            session.tensor_reshape(output, output_shape)
+        })
     }
 
     /// Alias for functional_bilinear.

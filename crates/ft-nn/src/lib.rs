@@ -1346,7 +1346,7 @@ pub struct Bilinear {
 }
 
 impl Bilinear {
-    /// Create a new Bilinear layer with uniform initialization.
+    /// Create a new F64 Bilinear layer with uniform initialization.
     pub fn new(
         session: &mut FrankenTorchSession,
         in1_features: usize,
@@ -1354,6 +1354,30 @@ impl Bilinear {
         out_features: usize,
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        Self::new_with_dtype(
+            session,
+            in1_features,
+            in2_features,
+            out_features,
+            use_bias,
+            DType::F64,
+        )
+    }
+
+    /// Create a Bilinear layer with F32 or F64 parameters.
+    ///
+    /// Parameters are trainable leaves even when constructed inside a no-grad
+    /// region. Both dtypes consume the same random stream; F32 rounds only
+    /// when creating the final parameter storage.
+    pub fn new_with_dtype(
+        session: &mut FrankenTorchSession,
+        in1_features: usize,
+        in2_features: usize,
+        out_features: usize,
+        use_bias: bool,
+        dtype: DType,
+    ) -> Result<Self, AutogradError> {
+        validate_parameter_dtype(dtype)?;
         if in1_features == 0 || in2_features == 0 || out_features == 0 {
             return Err(incompatible_error(
                 "Bilinear requires positive in1_features, in2_features, and out_features",
@@ -1376,10 +1400,11 @@ impl Bilinear {
         let w_shifted = session.tensor_sub(w_scaled, shift)?;
 
         let w_vals = session.tensor_values(w_shifted)?;
-        let weight = session.tensor_variable(
+        let weight = initialized_parameter(
+            session,
             w_vals,
             vec![out_features, in1_features, in2_features],
-            true,
+            dtype,
         )?;
 
         let bias = if use_bias {
@@ -1389,7 +1414,12 @@ impl Bilinear {
             let b_shift = session.full(vec![out_features], bound, false)?;
             let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
             let b_vals = session.tensor_values(b_shifted)?;
-            Some(session.tensor_variable(b_vals, vec![out_features], true)?)
+            Some(initialized_parameter(
+                session,
+                b_vals,
+                vec![out_features],
+                dtype,
+            )?)
         } else {
             None
         };
@@ -1406,87 +1436,23 @@ impl Bilinear {
     /// Compute bilinear forward: `y_k = x1^T W_k x2 + b_k`.
     ///
     /// `x1` has shape `[*, in1_features]`, `x2` has shape `[*, in2_features]`.
-    /// Output has shape `[*, out_features]`.
+    /// Their leading dimensions must match exactly. Inputs and parameters
+    /// share a dtype and device; CPU autocast preserves that dtype. Output
+    /// has shape `[*, out_features]`.
     pub fn forward_bilinear(
         &self,
         session: &mut FrankenTorchSession,
         x1: TensorNodeId,
         x2: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let x1_shape = session.tensor_shape(x1)?;
-        let x2_shape = session.tensor_shape(x2)?;
-        if x1_shape.is_empty() || x2_shape.is_empty() {
-            return Err(incompatible_error("bilinear: inputs must be at least 1-D"));
-        }
-        let x1_batch_shape = &x1_shape[..x1_shape.len() - 1];
-        let x2_batch_shape = &x2_shape[..x2_shape.len() - 1];
-        if !x1_batch_shape.iter().eq(x2_batch_shape.iter()) {
+        if session.tensor_shape(self.weight)?
+            != [self.out_features, self.in1_features, self.in2_features]
+        {
             return Err(incompatible_error(
-                "bilinear: input batch dimensions must match",
+                "bilinear: weight shape does not match declared module features",
             ));
         }
-        let in1 = self.in1_features;
-        let in2 = self.in2_features;
-        let out = self.out_features;
-
-        // Handle batched inputs
-        let batch = if x1_batch_shape.is_empty() {
-            1
-        } else {
-            checked_shape_numel(x1_batch_shape, "bilinear: batch shape overflow")?
-        };
-        let x1_last = *x1_shape.last().unwrap_or(&0);
-        let x2_last = *x2_shape.last().unwrap_or(&0);
-        if x1_last != in1 || x2_last != in2 {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "bilinear: input feature dimensions mismatch",
-                },
-            )));
-        }
-
-        // Compose through autograd-aware primitives. Tracked under
-        // frankentorch-yn0i. Math:
-        //   y[b, k] = sum_{i, j} x1[b, i] * W[k, i, j] * x2[b, j]
-        //          = (vec(x1[b] outer x2[b])) · vec(W[k])
-        // i.e. flatten the per-batch outer product into [batch, in1*in2]
-        // and matmul with reshape(W, [out, in1*in2]).T.
-        let x1_flat = session.tensor_reshape(x1, vec![batch, in1])?;
-        let x2_flat = session.tensor_reshape(x2, vec![batch, in2])?;
-        let x1_b = session.tensor_unsqueeze(x1_flat, 2)?; // [batch, in1, 1]
-        let x2_b = session.tensor_unsqueeze(x2_flat, 1)?; // [batch, 1, in2]
-        let x1_b_e = session.tensor_expand(x1_b, vec![batch, in1, in2])?;
-        let x2_b_e = session.tensor_expand(x2_b, vec![batch, in1, in2])?;
-        let outer = session.tensor_mul(x1_b_e, x2_b_e)?; // [batch, in1, in2]
-        let outer_flat = session.tensor_reshape(outer, vec![batch, in1 * in2])?;
-
-        let w_flat = session.tensor_reshape(self.weight, vec![out, in1 * in2])?;
-        let w_flat_t = session.tensor_transpose(w_flat, 0, 1)?; // [in1*in2, out]
-        let result = session.tensor_matmul(outer_flat, w_flat_t)?; // [batch, out]
-
-        let out_shape = if x1_shape.len() == 1 {
-            vec![out]
-        } else {
-            let mut s = x1_shape[..x1_shape.len() - 1].to_vec();
-            s.push(out);
-            s
-        };
-        let result_node = session.tensor_reshape(result, out_shape.clone())?;
-
-        if let Some(bias) = self.bias {
-            // bias is shape [out_features] (rank 1); reshape to a
-            // rank-matched broadcast shape (1s in leading dims,
-            // out_features in last) before expanding to out_shape.
-            // tensor_expand only broadcasts size-1 dims; it cannot
-            // add new dims. Tracked under frankentorch-3t8u.
-            let mut bias_broadcast_shape = vec![1usize; out_shape.len()];
-            *bias_broadcast_shape.last_mut().unwrap() = self.out_features;
-            let bias_reshaped = session.tensor_reshape(bias, bias_broadcast_shape)?;
-            let expanded_bias = session.tensor_expand(bias_reshaped, out_shape)?;
-            session.tensor_add(result_node, expanded_bias)
-        } else {
-            Ok(result_node)
-        }
+        session.functional_bilinear(x1, x2, self.weight, self.bias)
     }
 
     /// Access the weight parameter.
@@ -32814,6 +32780,389 @@ mod tests {
 
         assert!(Bilinear::new(&mut session, usize::MAX, 2, 2, false).is_err());
         assert!(Bilinear::new(&mut session, 2, 2, usize::MAX, false).is_err());
+    }
+
+    fn bilinear_test_tensor(
+        session: &mut FrankenTorchSession,
+        values: &[f64],
+        shape: &[usize],
+        dtype: DType,
+        requires_grad: bool,
+    ) -> TensorNodeId {
+        let tensor =
+            DenseTensor::from_contiguous_values(values.to_vec(), shape.to_vec(), Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+        session.tensor_variable_from_storage(tensor, requires_grad)
+    }
+
+    #[test]
+    fn bilinear_typed_constructor_preserves_initialization_and_trainable_leaves() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for use_bias in [false, true] {
+                let mut baseline = FrankenTorchSession::new(mode);
+                baseline.manual_seed(0xb11e_a123);
+                let mut oracle = baseline.clone();
+                let bound = 1.0 / 3.0_f64.sqrt();
+                let weight_draw = oracle.rand(vec![12], false).unwrap();
+                let mut expected = vec![
+                    oracle
+                        .tensor_values(weight_draw)
+                        .unwrap()
+                        .into_iter()
+                        .map(|value| value * (2.0 * bound) - bound)
+                        .collect::<Vec<_>>(),
+                ];
+                if use_bias {
+                    let bias_draw = oracle.rand(vec![2], false).unwrap();
+                    expected.push(
+                        oracle
+                            .tensor_values(bias_draw)
+                            .unwrap()
+                            .into_iter()
+                            .map(|value| value * (2.0 * bound) - bound)
+                            .collect(),
+                    );
+                }
+                let next = oracle.rand(vec![8], false).unwrap();
+                let expected_rng = oracle.tensor_values(next).unwrap();
+
+                for dtype in [DType::F64, DType::F32] {
+                    let mut session = baseline.clone();
+                    let module = session
+                        .with_no_grad(|session| {
+                            let module =
+                                Bilinear::new_with_dtype(session, 3, 2, 2, use_bias, dtype);
+                            assert!(!session.is_grad_enabled());
+                            module
+                        })
+                        .unwrap();
+                    assert!(session.is_grad_enabled());
+                    assert_eq!(session.tensor_shape(module.weight()).unwrap(), [2, 3, 2]);
+                    assert_eq!(module.bias().is_some(), use_bias);
+                    assert_eq!(module.parameters().len(), expected.len());
+                    for (&parameter, expected) in module.parameters().iter().zip(&expected) {
+                        assert_eq!(session.tensor_dtype(parameter).unwrap(), dtype);
+                        assert!(session.tensor_is_leaf(parameter).unwrap());
+                        assert!(session.tensor_requires_grad(parameter).unwrap());
+                        let actual: Vec<_> = session
+                            .tensor_values_lossy_f64(parameter)
+                            .unwrap()
+                            .into_iter()
+                            .map(f64::to_bits)
+                            .collect();
+                        let expected: Vec<_> = expected
+                            .iter()
+                            .map(|&value| {
+                                if dtype == DType::F32 {
+                                    (value as f32 as f64).to_bits()
+                                } else {
+                                    value.to_bits()
+                                }
+                            })
+                            .collect();
+                        assert_eq!(actual, expected);
+                    }
+                    let next = session.rand(vec![8], false).unwrap();
+                    assert_eq!(session.tensor_values(next).unwrap(), expected_rng);
+                }
+
+                let mut default_session = baseline;
+                let default = Bilinear::new(&mut default_session, 3, 2, 2, use_bias).unwrap();
+                for (&parameter, expected) in default.parameters().iter().zip(&expected) {
+                    assert_eq!(default_session.tensor_dtype(parameter).unwrap(), DType::F64);
+                    assert_eq!(default_session.tensor_values(parameter).unwrap(), *expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_typed_training_matches_weighted_gradient_oracle() {
+        let x1_values = [0.5, -1.0, 2.0, 0.25];
+        let x2_values = [1.5, -2.0, 0.5, -1.0, 0.75, 2.0];
+        let upstream = [1.25, -0.5, -0.75, 2.0];
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let mut session = FrankenTorchSession::new(mode);
+                session.manual_seed(0xb11e_a456);
+                let module = session
+                    .with_no_grad(|session| Bilinear::new_with_dtype(session, 2, 3, 2, true, dtype))
+                    .unwrap();
+                let weight = session.tensor_values_lossy_f64(module.weight()).unwrap();
+                let bias = session
+                    .tensor_values_lossy_f64(module.bias().unwrap())
+                    .unwrap();
+                let mut expected = vec![0.0; 4];
+                let mut dx1 = vec![0.0; 4];
+                let mut dx2 = vec![0.0; 6];
+                let mut dw = vec![0.0; 12];
+                let mut db = vec![0.0; 2];
+                // Independent per-example polynomial and all four VJPs.
+                for batch in 0..2 {
+                    for out in 0..2 {
+                        let output_index = batch * 2 + out;
+                        let gradient = upstream[output_index];
+                        expected[output_index] = bias[out];
+                        db[out] += gradient;
+                        for i in 0..2 {
+                            for j in 0..3 {
+                                let left = batch * 2 + i;
+                                let right = batch * 3 + j;
+                                let w = (out * 2 + i) * 3 + j;
+                                expected[output_index] +=
+                                    x1_values[left] * weight[w] * x2_values[right];
+                                dx1[left] += gradient * weight[w] * x2_values[right];
+                                dx2[right] += gradient * x1_values[left] * weight[w];
+                                dw[w] += gradient * x1_values[left] * x2_values[right];
+                            }
+                        }
+                    }
+                }
+                let x1 = bilinear_test_tensor(&mut session, &x1_values, &[2, 2], dtype, true);
+                let x2 = bilinear_test_tensor(&mut session, &x2_values, &[2, 3], dtype, true);
+                let output = module.forward_bilinear(&mut session, x1, x2).unwrap();
+                assert_eq!(session.tensor_shape(output).unwrap(), [2, 2]);
+                assert_eq!(session.tensor_dtype(output).unwrap(), dtype);
+                let tolerance = if dtype == DType::F32 { 1e-5 } else { 1e-11 };
+                let close = |actual: &[f64], expected: &[f64]| {
+                    assert_eq!(actual.len(), expected.len());
+                    for (&actual, &expected) in actual.iter().zip(expected) {
+                        assert!(
+                            (actual - expected).abs() <= tolerance * (1.0 + expected.abs()),
+                            "dtype={dtype:?}: got {actual}, expected {expected}"
+                        );
+                    }
+                };
+                close(&session.tensor_values_lossy_f64(output).unwrap(), &expected);
+                let seed = bilinear_test_tensor(&mut session, &upstream, &[2, 2], dtype, false);
+                let weighted = session.tensor_mul(output, seed).unwrap();
+                let loss = session.tensor_sum(weighted).unwrap();
+                let report = session.tensor_backward(loss).unwrap();
+                for (input, expected) in [
+                    (x1, &dx1),
+                    (x2, &dx2),
+                    (module.weight(), &dw),
+                    (module.bias().unwrap(), &db),
+                ] {
+                    close(session.tensor_gradient(&report, input).unwrap(), expected);
+                }
+
+                // Exercise the public parameter update boundary with the
+                // analytic gradient, without adding an optimizer dependency.
+                let learning_rate = 0.03125;
+                for parameter in module.parameters() {
+                    let gradient = session.tensor_gradient(&report, parameter).unwrap();
+                    let values = session.tensor_values_lossy_f64(parameter).unwrap();
+                    let updated: Vec<_> = values
+                        .iter()
+                        .zip(gradient)
+                        .map(|(&value, &gradient)| value - learning_rate * gradient)
+                        .collect();
+                    session
+                        .tensor_update_param_values(parameter, updated.clone())
+                        .unwrap();
+                    let expected: Vec<_> = updated
+                        .into_iter()
+                        .map(|value| {
+                            if dtype == DType::F32 {
+                                value as f32 as f64
+                            } else {
+                                value
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        session.tensor_values_lossy_f64(parameter).unwrap(),
+                        expected
+                    );
+                    assert_eq!(session.tensor_dtype(parameter).unwrap(), dtype);
+                    assert!(session.tensor_is_leaf(parameter).unwrap());
+                    assert!(session.tensor_requires_grad(parameter).unwrap());
+                }
+                let trained = session
+                    .with_no_grad(|session| module.forward_bilinear(session, x1, x2))
+                    .unwrap();
+                assert!(!session.tensor_requires_grad(trained).unwrap());
+                let trained_loss: f64 = session
+                    .tensor_values_lossy_f64(trained)
+                    .unwrap()
+                    .iter()
+                    .zip(upstream)
+                    .map(|(&value, seed)| value * seed)
+                    .sum();
+                let initial_loss: f64 = expected
+                    .iter()
+                    .zip(upstream)
+                    .map(|(&value, seed)| value * seed)
+                    .sum();
+                let squared_gradient: f64 = dw.iter().chain(&db).map(|value| value * value).sum();
+                close(
+                    &[trained_loss],
+                    &[initial_loss - learning_rate * squared_gradient],
+                );
+                assert!(trained_loss < initial_loss);
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_typed_state_dict_roundtrip_preserves_trainable_parameters() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            for dtype in [DType::F32, DType::F64] {
+                let make = |session: &mut FrankenTorchSession| {
+                    Bilinear::new_with_dtype(session, 2, 3, 2, true, dtype)
+                };
+                let mut session = FrankenTorchSession::new(mode);
+                session.manual_seed(0xb11e_a789);
+                let module = session.with_no_grad(make).unwrap();
+                session
+                    .tensor_update_param_values(module.bias().unwrap(), vec![-0.0, 0.75])
+                    .unwrap();
+                let state = module.state_dict(&session).unwrap();
+                assert_eq!(
+                    state.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["bias", "weight"]
+                );
+                let typed = state
+                    .iter()
+                    .map(|(name, tensor)| {
+                        (
+                            name.clone(),
+                            ft_serialize::TypedStateEntry::Dense(tensor.clone()),
+                        )
+                    })
+                    .collect();
+                let bytes = ft_serialize::encode_typed_state_dict_to_bytes(&typed).unwrap();
+                let checkpoint = ft_serialize::load_state_dict_from_bytes(&bytes).unwrap();
+
+                let mut resumed = FrankenTorchSession::new(mode);
+                resumed.manual_seed(0xb11e_a987);
+                let _different_ids = resumed.tensor_variable(vec![0.0], vec![1], false).unwrap();
+                let restored = resumed.with_no_grad(make).unwrap();
+                let parameter_ids = restored.parameters();
+                assert_ne!(parameter_ids, module.parameters());
+                let report = restored
+                    .load_state_dict(&mut resumed, &checkpoint, true)
+                    .unwrap();
+                assert!(report.missing_keys.is_empty());
+                assert!(report.unexpected_keys.is_empty());
+                assert_eq!(restored.parameters(), parameter_ids);
+                for parameter in parameter_ids {
+                    assert_eq!(resumed.tensor_dtype(parameter).unwrap(), dtype);
+                    assert!(resumed.tensor_is_leaf(parameter).unwrap());
+                    assert!(resumed.tensor_requires_grad(parameter).unwrap());
+                }
+                let restored_state = restored.state_dict(&resumed).unwrap();
+                for (name, tensor) in &state {
+                    assert_eq!(restored_state[name].meta(), tensor.meta());
+                    assert_eq!(
+                        model_state_storage_bits(&restored_state[name]),
+                        model_state_storage_bits(tensor)
+                    );
+                }
+
+                let x1_values = [0.5, -1.0, 2.0, 0.25];
+                let x2_values = [1.5, -2.0, 0.5, -1.0, 0.75, 2.0];
+                let x1 = bilinear_test_tensor(&mut session, &x1_values, &[2, 2], dtype, false);
+                let x2 = bilinear_test_tensor(&mut session, &x2_values, &[2, 3], dtype, false);
+                let restored_x1 =
+                    bilinear_test_tensor(&mut resumed, &x1_values, &[2, 2], dtype, false);
+                let restored_x2 =
+                    bilinear_test_tensor(&mut resumed, &x2_values, &[2, 3], dtype, false);
+                let expected = session
+                    .with_no_grad(|session| module.forward_bilinear(session, x1, x2))
+                    .unwrap();
+                let actual = resumed
+                    .with_no_grad(|session| {
+                        restored.forward_bilinear(session, restored_x1, restored_x2)
+                    })
+                    .unwrap();
+                assert_eq!(resumed.tensor_dtype(actual).unwrap(), dtype);
+                assert!(!resumed.tensor_requires_grad(actual).unwrap());
+                assert_eq!(
+                    resumed.tensor_values_lossy_f64(actual).unwrap(),
+                    session.tensor_values_lossy_f64(expected).unwrap()
+                );
+                let output = restored
+                    .forward_bilinear(&mut resumed, restored_x1, restored_x2)
+                    .unwrap();
+                let loss = resumed.tensor_sum(output).unwrap();
+                let report = resumed.tensor_backward(loss).unwrap();
+                for parameter in restored.parameters() {
+                    assert!(resumed.tensor_gradient(&report, parameter).is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_typed_validation_rejects_before_nodes_or_rng() {
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let mut session = FrankenTorchSession::new(mode);
+            session.manual_seed(0xb11e_aabc);
+            let mut untouched = session.clone();
+            let before = session.autograd_graph_node_count();
+            for dtype in [
+                DType::F16,
+                DType::BF16,
+                DType::I64,
+                DType::Bool,
+                DType::Complex64,
+                DType::QInt8,
+            ] {
+                session.with_no_grad(|session| {
+                    assert!(Bilinear::new_with_dtype(session, 2, 3, 2, true, dtype).is_err());
+                    assert!(!session.is_grad_enabled());
+                });
+                assert!(session.is_grad_enabled());
+                assert_eq!(session.autograd_graph_node_count(), before);
+            }
+            for dtype in [DType::F32, DType::F64] {
+                for (in1, in2, out) in [
+                    (0, 3, 2),
+                    (2, 0, 2),
+                    (2, 3, 0),
+                    (usize::MAX, 2, 2),
+                    (2, 2, usize::MAX),
+                ] {
+                    session.with_no_grad(|session| {
+                        assert!(
+                            Bilinear::new_with_dtype(session, in1, in2, out, true, dtype).is_err()
+                        );
+                        assert!(!session.is_grad_enabled());
+                    });
+                    assert!(session.is_grad_enabled());
+                    assert_eq!(session.autograd_graph_node_count(), before);
+                }
+            }
+            let next = session.rand(vec![8], false).unwrap();
+            let expected = untouched.rand(vec![8], false).unwrap();
+            assert_eq!(
+                session.tensor_values(next).unwrap(),
+                untouched.tensor_values(expected).unwrap()
+            );
+
+            let weight =
+                bilinear_test_tensor(&mut session, &[1.0; 4], &[1, 2, 2], DType::F32, true);
+            let invalid = Bilinear {
+                weight,
+                bias: None,
+                in1_features: 2,
+                in2_features: 3,
+                out_features: 1,
+            };
+            let x1 = bilinear_test_tensor(&mut session, &[1.0, 2.0], &[2], DType::F32, false);
+            let x2 = bilinear_test_tensor(&mut session, &[1.0, 2.0, 3.0], &[3], DType::F32, false);
+            let before = session.autograd_graph_node_count();
+            let error = invalid.forward_bilinear(&mut session, x1, x2).unwrap_err();
+            assert!(
+                format!("{error:?}")
+                    .contains("weight shape does not match declared module features")
+            );
+            assert_eq!(session.autograd_graph_node_count(), before);
+        }
     }
 
     // ── Unfold / Fold Tests ──────────────────────────────────────────
