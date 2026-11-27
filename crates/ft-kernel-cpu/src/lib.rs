@@ -3924,6 +3924,35 @@ fn ensure_storage_len(
     Ok(())
 }
 
+fn ensure_strided_storage_len<T>(
+    buffer: &[T],
+    meta: &TensorMeta,
+    side: &'static str,
+) -> Result<(), KernelError> {
+    if meta.numel() == 0 {
+        return Ok(());
+    }
+    let overflow = || KernelError::StorageSpanOverflow {
+        side,
+        storage_offset: meta.storage_offset(),
+        numel: meta.numel(),
+    };
+    let mut needed = meta.storage_offset();
+    for (&size, &stride) in meta.shape().iter().zip(meta.strides()) {
+        let span = (size - 1).checked_mul(stride).ok_or_else(overflow)?;
+        needed = needed.checked_add(span).ok_or_else(overflow)?;
+    }
+    needed = needed.checked_add(1).ok_or_else(overflow)?;
+    if buffer.len() < needed {
+        return Err(KernelError::InsufficientStorage {
+            side,
+            needed,
+            available: buffer.len(),
+        });
+    }
+    Ok(())
+}
+
 fn elementwise_f64<F>(
     lhs: &[f64],
     rhs: &[f64],
@@ -3937,7 +3966,7 @@ where
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
 
     if !lhs_meta.is_contiguous() || !rhs_meta.is_contiguous() {
-        return elementwise_strided_f64(lhs, rhs, lhs_meta, rhs_meta, op);
+        return elementwise_strided(lhs, rhs, lhs_meta, rhs_meta, op);
     }
 
     ensure_storage_len(lhs, lhs_meta, "lhs")?;
@@ -4000,21 +4029,24 @@ fn increment_coords(coords: &mut [usize], shape: &[usize]) -> bool {
     false
 }
 
-fn elementwise_strided_f64<F>(
-    lhs: &[f64],
-    rhs: &[f64],
+fn elementwise_strided<T, F>(
+    lhs: &[T],
+    rhs: &[T],
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
     op: F,
-) -> Result<Vec<f64>, KernelError>
+) -> Result<Vec<T>, KernelError>
 where
-    F: Fn(f64, f64) -> f64 + Sync,
+    T: Copy + Send + Sync,
+    F: Fn(T, T) -> T + Sync,
 {
     let shape = lhs_meta.shape();
     let numel = lhs_meta.numel();
     if numel == 0 {
         return Ok(Vec::new());
     }
+    ensure_strided_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_strided_storage_len(rhs, rhs_meta, "rhs")?;
 
     let lhs_strides = lhs_meta.strides();
     let rhs_strides = rhs_meta.strides();
@@ -4034,7 +4066,7 @@ where
         out_strides[d] = out_strides[d + 1] * shape[d + 1];
     }
 
-    let compute = |i: usize| -> f64 {
+    let compute = |i: usize| -> T {
         let mut rem = i;
         let mut lhs_idx = lhs_offset;
         let mut rhs_idx = rhs_offset;
@@ -4047,7 +4079,7 @@ where
         op(lhs[lhs_idx], rhs[rhs_idx])
     };
 
-    let output: Vec<f64> = if numel >= PARALLEL_THRESHOLD {
+    let output: Vec<T> = if numel >= PARALLEL_THRESHOLD {
         (0..numel).into_par_iter().map(compute).collect()
     } else {
         (0..numel).map(compute).collect()
@@ -6106,7 +6138,7 @@ where
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
 
     if !lhs_meta.is_contiguous() || !rhs_meta.is_contiguous() {
-        return elementwise_strided_f64(lhs, rhs, lhs_meta, rhs_meta, scalar_op);
+        return elementwise_strided(lhs, rhs, lhs_meta, rhs_meta, scalar_op);
     }
 
     ensure_storage_len(lhs, lhs_meta, "lhs")?;
@@ -46609,6 +46641,9 @@ where
     F: Fn(f32, f32) -> f32 + Sync,
 {
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
+    if !lhs_meta.is_contiguous() || !rhs_meta.is_contiguous() {
+        return elementwise_strided(lhs, rhs, lhs_meta, rhs_meta, op);
+    }
     ensure_storage_len_f32(lhs, lhs_meta, "lhs")?;
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let numel = lhs_meta.numel();
@@ -46652,6 +46687,12 @@ where
     S: Fn(f32x8, f32x8) -> f32x8 + Sync,
 {
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
+    // Both operands retain their own strides and offsets. Reading a physical
+    // storage window here silently permutes outputs for transposed F32 tensors
+    // and for F16/BF16 tensors promoted through this kernel.
+    if !lhs_meta.is_contiguous() || !rhs_meta.is_contiguous() {
+        return elementwise_strided(lhs, rhs, lhs_meta, rhs_meta, scalar_op);
+    }
     ensure_storage_len_f32(lhs, lhs_meta, "lhs")?;
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let numel = lhs_meta.numel();
@@ -72656,8 +72697,115 @@ mod tests {
     }
 
     #[test]
+    fn strided_f32_binary_kernels_preserve_logical_order_and_precision() {
+        type Kernel = fn(&[f32], &[f32], &TensorMeta, &TensorMeta) -> Result<Vec<f32>, KernelError>;
+        type Reference = fn(f32, f32) -> f32;
+        let operations: [(&str, Kernel, Reference); 7] = [
+            ("add", super::add_tensor_contiguous_f32, |a, b| a + b),
+            ("sub", super::sub_tensor_contiguous_f32, |a, b| a - b),
+            ("mul", super::mul_tensor_contiguous_f32, |a, b| a * b),
+            ("div", super::div_tensor_contiguous_f32, |a, b| a / b),
+            ("atan2", super::atan2_tensor_contiguous_f32, f32::atan2),
+            ("minimum", super::min_tensor_contiguous_f32, f32::min),
+            ("maximum", super::max_tensor_contiguous_f32, f32::max),
+        ];
+        // The large rectangle exercises the parallel traversal. The RHS uses
+        // an independent contiguous, transposed, or zero-stride layout.
+        for (rows, cols) in [(2, 3), (1, 7), (97, 101)] {
+            let n = rows * cols;
+            let lhs: Vec<f32> = (0..n + 3).map(|i| (i % 31) as f32 * 0.125 - 1.75).collect();
+            let rhs: Vec<f32> = (0..n + 4)
+                .map(|i| (i % 29) as f32 * 0.0625 + 0.125)
+                .collect();
+            let lhs_meta = TensorMeta::from_shape_and_strides(
+                vec![rows, cols],
+                vec![1, rows],
+                1,
+                DType::F32,
+                Device::Cpu,
+            )
+            .unwrap();
+            for strides in [vec![cols, 1], vec![1, rows], vec![0, 1]] {
+                let rhs_meta = TensorMeta::from_shape_and_strides(
+                    vec![rows, cols],
+                    strides.clone(),
+                    2,
+                    DType::F32,
+                    Device::Cpu,
+                )
+                .unwrap();
+                for (name, kernel, reference) in operations {
+                    let got = kernel(&lhs, &rhs, &lhs_meta, &rhs_meta).unwrap();
+                    assert_eq!(got.len(), n);
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let expected = reference(
+                                lhs[1 + row + col * rows],
+                                rhs[2 + row * strides[0] + col * strides[1]],
+                            );
+                            assert_eq!(
+                                got[row * cols + col].to_bits(),
+                                expected.to_bits(),
+                                "{name}, shape={rows}x{cols}, strides={strides:?}, ({row},{col})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strided_binary_kernels_validate_storage_spans() {
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 3], vec![1, 4], 2, DType::F32, Device::Cpu)
+                .unwrap();
+        assert!(matches!(
+            super::mul_tensor_contiguous_f32(&[1.0; 8], &[2.0; 12], &meta, &meta),
+            Err(KernelError::InsufficientStorage {
+                side: "lhs",
+                needed: 12,
+                ..
+            })
+        ));
+        assert!(matches!(
+            super::add_tensor_contiguous_f32(&[1.0; 12], &[2.0; 8], &meta, &meta),
+            Err(KernelError::InsufficientStorage {
+                side: "rhs",
+                needed: 12,
+                ..
+            })
+        ));
+        let overflow = TensorMeta::from_shape_and_strides(
+            vec![2],
+            vec![usize::MAX],
+            0,
+            DType::F32,
+            Device::Cpu,
+        )
+        .unwrap();
+        assert!(matches!(
+            super::mul_tensor_contiguous_f32(&[1.0], &[2.0], &overflow, &overflow),
+            Err(KernelError::StorageSpanOverflow { side: "lhs", .. })
+        ));
+        let empty = TensorMeta::from_shape_and_strides(
+            vec![0, 3],
+            vec![1, 0],
+            usize::MAX,
+            DType::F32,
+            Device::Cpu,
+        )
+        .unwrap();
+        assert!(
+            super::mul_tensor_contiguous_f32(&[], &[], &empty, &empty)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn elementwise_strided_parallel_matches_serial_bit_exact() {
-        // The non-contiguous same-shape binary path (elementwise_strided_f64) only
+        // The non-contiguous same-shape binary path (elementwise_strided) only
         // parallelizes above PARALLEL_THRESHOLD (>=8192), so small tests exercise
         // the serial fallback. Drive a LARGE transposed (non-contiguous) view of a
         // row-major buffer through atan2 and compare against an independent serial

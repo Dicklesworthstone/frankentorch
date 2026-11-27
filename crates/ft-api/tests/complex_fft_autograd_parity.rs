@@ -3318,18 +3318,32 @@ fn strided_native_products_preserve_weighted_first_second_and_third_derivatives(
                     true,
                 );
                 let square = session.tensor_mul(input, input).unwrap();
+                assert_eq!(
+                    session.tensor_values_lossy_f64(square).unwrap(),
+                    &[4.0, 0.0625, 0.25, 9.0],
+                    "square forward: {mode:?}, {dtype:?}"
+                );
                 let cubic = session.tensor_mul(square, input).unwrap();
+                assert_eq!(
+                    session.tensor_values_lossy_f64(cubic).unwrap(),
+                    &[-8.0, 0.015625, -0.125, 27.0],
+                    "cubic forward: {mode:?}, {dtype:?}"
+                );
                 let first = session
                     .tensor_autograd_grad_report(
                         &[cubic],
                         &[input],
                         Some(&[vec![1.0, -2.0, 3.0, 0.5]]),
-                        create_graph,
                         true,
+                        create_graph,
                     )
                     .unwrap();
                 // For L = sum(w*x^3), dL/dx = 3*w*x^2.
-                assert_eq!(first.gradient(input).unwrap(), &[12.0, -0.375, 2.25, 13.5]);
+                assert_eq!(
+                    first.gradient(input).unwrap(),
+                    &[12.0, -0.375, 2.25, 13.5],
+                    "first derivative: {mode:?}, {dtype:?}, create_graph={create_graph}"
+                );
                 if create_graph {
                     let first_node = first.gradient_node(input).unwrap();
                     let second = session

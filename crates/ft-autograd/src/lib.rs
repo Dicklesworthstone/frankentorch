@@ -20547,8 +20547,14 @@ impl TensorTape {
             // Saved forward operands may be offset or strided leaves. Read
             // their logical elements without replacing the original graph
             // edges: subsequent derivatives must still reach those leaves.
-            let lhs_data = lhs_node.tensor.to_contiguous()?.contiguous_values_as_f64()?;
-            let rhs_data = rhs_node.tensor.to_contiguous()?.contiguous_values_as_f64()?;
+            let lhs_data = lhs_node
+                .tensor
+                .to_contiguous()?
+                .contiguous_values_as_f64()?;
+            let rhs_data = rhs_node
+                .tensor
+                .to_contiguous()?
+                .contiguous_values_as_f64()?;
             let lhs_shape = lhs_node.tensor.meta().shape().to_vec();
             let rhs_shape = rhs_node.tensor.meta().shape().to_vec();
             let device = lhs_node.tensor.meta().device();
