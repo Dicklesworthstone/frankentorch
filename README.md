@@ -68,6 +68,44 @@ Supporting layers:
 - `crates/ft-optim`: optimizers such as SGD, Adam, and AdamW
 - `crates/ft-data`: dataset and dataloader primitives
 
+## Stable Rust and SIMD
+
+The CPU dependency stack supports **stable Rust 1.95 or newer** with its default
+features. SIMD stays enabled: the default kernels use `wide`, and the existing
+x86_64 AVX2/AVX-512-VNNI and aarch64 NEON paths retain their CPU-feature detection
+and scalar fallbacks. No nightly feature gate is active in this configuration.
+
+The repository pins a nightly development toolchain in `rust-toolchain.toml`.
+Select stable explicitly when checking a checkout:
+
+```bash
+rustup toolchain install stable --profile minimal
+cargo +stable check --locked \
+  -p frankentorch-core -p frankentorch-kernel-cpu \
+  -p ft-serialize -p frankentorch-runtime \
+  --features frankentorch-runtime/asupersync-integration
+cargo +stable test --locked -j2 -p frankentorch-kernel-cpu
+```
+
+`ft-serialize` is the serialization package name. The runtime's optional
+`asupersync-integration` feature and serialization both use `asupersync 0.7`
+with its default features disabled, allowing consumers to share that dependency.
+
+The CPU kernel crate also offers an opt-in **`nightly-simd`** feature for its
+`std::simd` pooling path. It requires a nightly compiler:
+
+```bash
+cargo +nightly test --locked -j2 -p frankentorch-kernel-cpu \
+  --features frankentorch-kernel-cpu/nightly-simd
+```
+
+Enabling `--all-features` includes `nightly-simd`, so use nightly for that build.
+CI checks the default kernels on Rust 1.95 and current stable on both x86_64 and
+native aarch64, and the optional portable-SIMD kernels on nightly. The same
+equivalence tests cover both implementations, including optimized pooling and
+int8 kernels. An independent Rust 1.95 consumer also checks compatibility with
+an exact `asupersync = "=0.7.0"` dependency outside the repository workspace.
+
 ## Compatibility and Security Stance
 
 Preserve full PyTorch-observable tensor semantics, autograd contracts, optimizer behaviors, serialization contracts, and runtime compatibility invariants required for drop-in use.

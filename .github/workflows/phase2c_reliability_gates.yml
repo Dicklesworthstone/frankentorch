@@ -21,6 +21,123 @@ permissions:
   contents: read
 
 jobs:
+  cpu-toolchain-compatibility:
+    name: CPU kernels (${{ matrix.toolchain }}, ${{ matrix.runner }}, ${{ matrix.simd }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            toolchain: '1.95.0'
+            simd: stable
+          - runner: ubuntu-24.04-arm
+            toolchain: '1.95.0'
+            simd: stable
+          - runner: ubuntu-latest
+            toolchain: stable
+            simd: stable
+          - runner: ubuntu-24.04-arm
+            toolchain: stable
+            simd: stable
+          - runner: ubuntu-latest
+            toolchain: nightly-2026-08-31
+            simd: nightly-simd
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+      RUST_TOOLCHAIN: ${{ matrix.toolchain }}
+      SIMD_FEATURE: ${{ matrix.simd }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install test Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cpu-${{ matrix.runner }}-${{ matrix.toolchain }}-${{ matrix.simd }}
+
+      - name: Check downstream CPU packages with async integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          simd_flags=()
+          if [[ "$SIMD_FEATURE" == nightly-simd ]]; then
+            simd_flags=(--features frankentorch-kernel-cpu/nightly-simd)
+          fi
+          cargo +"$RUST_TOOLCHAIN" check --locked \
+            -p frankentorch-core -p frankentorch-kernel-cpu \
+            -p ft-serialize -p frankentorch-runtime \
+            --features frankentorch-runtime/asupersync-integration "${simd_flags[@]}"
+
+      - name: Check an independent stable consumer with asupersync 0.7.0
+        if: ${{ matrix.toolchain == '1.95.0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer_dir=$(mktemp -d "$RUNNER_TEMP/frankentorch-stable-consumer.XXXXXX")
+          mkdir "$consumer_dir/src"
+          cat > "$consumer_dir/Cargo.toml" <<TOML
+          [package]
+          name = "frankentorch-stable-consumer"
+          version = "0.0.0"
+          edition = "2024"
+
+          [workspace]
+
+          [dependencies]
+          ft-core = { package = "frankentorch-core", path = "$GITHUB_WORKSPACE/crates/ft-core" }
+          ft-kernel-cpu = { package = "frankentorch-kernel-cpu", path = "$GITHUB_WORKSPACE/crates/ft-kernel-cpu" }
+          ft-serialize = { path = "$GITHUB_WORKSPACE/crates/ft-serialize" }
+          ft-runtime = { package = "frankentorch-runtime", path = "$GITHUB_WORKSPACE/crates/ft-runtime", features = ["asupersync-integration"] }
+          asupersync = { version = "=0.7.0", default-features = false }
+          TOML
+          cat > "$consumer_dir/src/main.rs" <<'RS'
+          fn main() {
+              // A duplicate asupersync version gives a distinct Cx type and fails.
+              let _: asupersync::Cx<asupersync::cx::cap::None> =
+                  ft_runtime::detached_runtime_cx();
+          }
+          RS
+          # Cargo discovers configuration from cwd. Resolve this consumer's own
+          # graph outside the checkout, without the workspace lockfile or patches.
+          cd "$consumer_dir"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo +"$RUST_TOOLCHAIN" check
+
+      - name: Kernel equivalence and native intrinsic regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          simd_flags=()
+          if [[ "$SIMD_FEATURE" == nightly-simd ]]; then
+            simd_flags=(--features nightly-simd)
+          fi
+          if [[ $(uname -m) == aarch64 ]]; then
+            # The native ARM lane must execute SDOT, not silently skip its test.
+            export FT_TEST_REQUIRE_DOTPROD=1
+          fi
+          # Run unit, integration, and doc tests with the same kernel surface on
+          # stable and nightly. Native ARM also exercises its NEON implementation.
+          cargo +"$RUST_TOOLCHAIN" test --locked -j2 \
+            -p frankentorch-kernel-cpu "${simd_flags[@]}"
+          # Check optimized floating-point behavior and architecture dispatch too.
+          cargo +"$RUST_TOOLCHAIN" test --locked --release -j2 \
+            -p frankentorch-kernel-cpu "${simd_flags[@]}" --lib avg_pool2d_
+          cargo +"$RUST_TOOLCHAIN" test --locked --release -j2 \
+            -p frankentorch-kernel-cpu "${simd_flags[@]}" --test dynamic_int8_exact
+          if [[ $(uname -m) == aarch64 ]]; then
+            cargo +"$RUST_TOOLCHAIN" test --locked --release -j2 \
+              -p frankentorch-kernel-cpu "${simd_flags[@]}" \
+              --lib sdot_accumulate_i8x16_matches_wrapping_scalar_lanes
+          fi
+
   training-semantics:
     name: Focused training semantics
     runs-on: ubuntu-latest
