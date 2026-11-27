@@ -13,6 +13,11 @@ include = ["src/**", "benches/**", "Cargo.toml", "LICENSE", "README.md"]
 [lib]
 name = "ft_kernel_cpu"
 
+[features]
+default = []
+# Opt in to std::simd on nightly; stable builds retain wide and CPU intrinsics.
+nightly-simd = []
+
 [dependencies]
 ft-core = { workspace = true }
 libm = { workspace = true }

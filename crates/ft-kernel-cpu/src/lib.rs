@@ -1,9 +1,10 @@
-// The aarch64 NEON dot-product intrinsics used below are stable on the pinned
-// toolchain; the architecture-specific implementations remain cfg-gated.
+// Architecture-specific kernels retain their runtime CPU-feature checks.
+// Only the opt-in portable SIMD backend requires a nightly toolchain.
 #![deny(unsafe_code)]
-#![feature(portable_simd)]
+#![cfg_attr(feature = "nightly-simd", feature(portable_simd))]
 
 use std::fmt;
+#[cfg(feature = "nightly-simd")]
 use std::simd::Simd;
 
 #[cfg(target_arch = "x86_64")]
@@ -3682,6 +3683,8 @@ pub fn min_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor
     ensure_compatible(lhs, rhs)?;
     let val = if lhs.value().is_nan() || rhs.value().is_nan() {
         f64::NAN
+    } else if lhs.value() == rhs.value() {
+        lhs.value()
     } else {
         lhs.value().min(rhs.value())
     };
@@ -3692,6 +3695,8 @@ pub fn max_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor
     ensure_compatible(lhs, rhs)?;
     let val = if lhs.value().is_nan() || rhs.value().is_nan() {
         f64::NAN
+    } else if lhs.value() == rhs.value() {
+        lhs.value()
     } else {
         lhs.value().max(rhs.value())
     };
@@ -5587,11 +5592,11 @@ pub fn min_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    // SIMD-accelerated (f64x4) like add/sub/mul/div_f64; the f64 sibling of the f32 max/min
-    // SIMD win. Scalar op is the unchanged NaN-propagating fmin; the SIMD op computes the same
-    // value lanewise (f64x4::min is fmin-faithful incl. IEEE ±0 sign) then forces NaN where
-    // either operand is NaN. Strided falls back to scalar inside simd_elementwise_f64. Bit-exact
-    // is guarded by min_max_f64_simd_matches_scalar_bit_for_bit.
+    // Match PyTorch's minimum/maximum: propagate NaN and retain the FIRST operand
+    // when values compare equal, including opposite signed zeros. Rust's scalar
+    // min/max and SIMD min/max do not promise the same zero sign across toolchains
+    // or targets, so both paths select ties explicitly. The scalar closure also
+    // handles tails and strided layouts through simd_elementwise_f64.
     simd_elementwise_f64(
         lhs,
         rhs,
@@ -5600,13 +5605,16 @@ pub fn min_tensor_contiguous_f64(
         |l, r| {
             if l.is_nan() || r.is_nan() {
                 f64::NAN
+            } else if l == r {
+                l
             } else {
                 l.min(r)
             }
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
+            let value = a.simd_eq(b).select(a, a.min(b));
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, value))
         },
     )
 }
@@ -5626,13 +5634,16 @@ pub fn max_tensor_contiguous_f64(
         |l, r| {
             if l.is_nan() || r.is_nan() {
                 f64::NAN
+            } else if l == r {
+                l
             } else {
                 l.max(r)
             }
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
+            let value = a.simd_eq(b).select(a, a.max(b));
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, value))
         },
     )
 }
@@ -16194,8 +16205,14 @@ fn avg_pool2d_backward_2x2s2_f64(
         // help: a hit skips the zero pass and the faults, a miss is exactly the
         // code that was here before.
         let fill = |dp: &mut [f64]| {
+            #[cfg(feature = "nightly-simd")]
             let zero = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.0);
+            #[cfg(feature = "nightly-simd")]
             let quarter = Simd::<f64, AVG_POOL2D_BACKWARD_SIMD_LANES>::splat(0.25);
+            #[cfg(not(feature = "nightly-simd"))]
+            let zero = f64x4::splat(0.0);
+            #[cfg(not(feature = "nightly-simd"))]
+            let quarter = f64x4::splat(0.25);
             dp.par_chunks_mut(ih * iw)
                 .enumerate()
                 .for_each(|(plane, drow)| {
@@ -16209,29 +16226,35 @@ fn avg_pool2d_backward_2x2s2_f64(
                             // Exact per-lane transcription of `0.0 + dout[...] / 4.0`.
                             // The zero add is deliberately retained for -0.0 parity; each
                             // lane is independent, so this changes no accumulation order.
-                            let g = zero
-                                + Simd::from_slice(
-                                    &dout[dbase + oy * ow + ox
-                                        ..dbase + oy * ow + ox + AVG_POOL2D_BACKWARD_SIMD_LANES],
-                                ) * quarter;
-                            let (first_pair, second_pair) = g.interleave(g);
+                            let values = &dout[dbase + oy * ow + ox
+                                ..dbase + oy * ow + ox + AVG_POOL2D_BACKWARD_SIMD_LANES];
+                            #[cfg(feature = "nightly-simd")]
+                            let (first_pair, second_pair) = {
+                                let g = zero + Simd::from_slice(values) * quarter;
+                                let (first, second) = g.interleave(g);
+                                (first.to_array(), second.to_array())
+                            };
+                            #[cfg(not(feature = "nightly-simd"))]
+                            let (first_pair, second_pair) = {
+                                let g = (zero
+                                    + f64x4::new([values[0], values[1], values[2], values[3]])
+                                        * quarter)
+                                    .to_array();
+                                // Duplicate each gradient into its two input columns,
+                                // preserving the same lane order as Simd::interleave.
+                                ([g[0], g[0], g[1], g[1]], [g[2], g[2], g[3], g[3]])
+                            };
                             let col0 = ox * 2;
-                            first_pair.copy_to_slice(
-                                &mut drow
-                                    [row0 + col0..row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
-                            );
-                            second_pair.copy_to_slice(
-                                &mut drow[row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
-                                    ..row0 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
-                            );
-                            first_pair.copy_to_slice(
-                                &mut drow
-                                    [row1 + col0..row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES],
-                            );
-                            second_pair.copy_to_slice(
-                                &mut drow[row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
-                                    ..row1 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES],
-                            );
+                            drow[row0 + col0..row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES]
+                                .copy_from_slice(&first_pair);
+                            drow[row0 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                ..row0 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES]
+                                .copy_from_slice(&second_pair);
+                            drow[row1 + col0..row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES]
+                                .copy_from_slice(&first_pair);
+                            drow[row1 + col0 + AVG_POOL2D_BACKWARD_SIMD_LANES
+                                ..row1 + col0 + 2 * AVG_POOL2D_BACKWARD_SIMD_LANES]
+                                .copy_from_slice(&second_pair);
                         }
                         for ox in vectorized_ow..ow {
                             let col0 = ox * 2;
@@ -47363,14 +47386,10 @@ macro_rules! define_binary_f32 {
     };
 }
 
-// min/max f32: SIMD-accelerated via simd_elementwise_f32 (same parallel-SIMD path as
-// add/sub/mul/div, kgs4.167) instead of the scalar elementwise loop (was ~1.3-1.6x SLOWER
-// than torch). The scalar op is unchanged (NaN-propagating fmax/fmin); the SIMD op computes
-// the SAME result lanewise: f32x8::max/min for the non-NaN value, then any lane where either
-// operand is NaN is forced to NaN (torch + the scalar path propagate NaN). The simd<->scalar
-// boundary lane is bit-identical because both forms compute the same per-lane value. An
-// exhaustive ±0/±inf/NaN/subnormal parity test (min_max_f32_simd_matches_scalar_bit_for_bit)
-// guards the bit-exactness (incl. the IEEE sign-of-zero on ±0 ties).
+// min/max f32 use the same parallel-SIMD path as add/sub/mul/div. Like the f64
+// kernels, they propagate NaN and explicitly select the first operand on equal
+// values. This pins PyTorch's signed-zero behavior across scalar tails, SIMD
+// lanes, targets and Rust versions rather than relying on min/max tie handling.
 pub fn min_tensor_contiguous_f32(
     lhs: &[f32],
     rhs: &[f32],
@@ -47385,13 +47404,16 @@ pub fn min_tensor_contiguous_f32(
         |l: f32, r: f32| {
             if l.is_nan() || r.is_nan() {
                 f32::NAN
+            } else if l == r {
+                l
             } else {
                 l.min(r)
             }
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
+            let value = a.simd_eq(b).select(a, a.min(b));
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, value))
         },
     )
 }
@@ -47409,13 +47431,16 @@ pub fn max_tensor_contiguous_f32(
         |l: f32, r: f32| {
             if l.is_nan() || r.is_nan() {
                 f32::NAN
+            } else if l == r {
+                l
             } else {
                 l.max(r)
             }
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
+            let value = a.simd_eq(b).select(a, a.max(b));
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, value))
         },
     )
 }
@@ -48131,7 +48156,7 @@ pub fn linear_int8_dynamic_f32(
     // macro-tile so each loaded int8 vector feeds 4 dot-products before eviction
     // (compute:load ~= 2:1) — eliminating the per-output-element dispatch and the
     // activation re-load that bottlenecked the naive per-element path. Parallel
-    // over 4-row output blocks. Bit-identical: vdotq accumulates the same i32 sum.
+    // over 4-row output blocks. Bit-identical: SDOT accumulates the same i32 sum.
     #[cfg(target_arch = "aarch64")]
     {
         if k >= 16 && std::arch::is_aarch64_feature_detected!("dotprod") {
@@ -48170,12 +48195,46 @@ pub fn linear_int8_dynamic_f32(
     out
 }
 
+/// Accumulate four signed-byte dot products into four wrapping i32 lanes.
+///
+/// `vdotq_s32` was stabilized in Rust 1.98. Emitting its single SDOT instruction
+/// directly keeps the accelerated kernels available on the Rust 1.95 baseline.
+/// The vector operands and accumulator stay in NEON registers; no memory is
+/// accessed and no flags are modified by this non-saturating instruction.
+///
+/// # Safety
+///
+/// The caller must have verified that the CPU supports `dotprod`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+#[allow(unsafe_code)]
+unsafe fn sdot_accumulate_i8x16(
+    mut acc: std::arch::aarch64::int32x4_t,
+    lhs: std::arch::aarch64::int8x16_t,
+    rhs: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    // SAFETY: the caller provides dotprod support. SDOT reads the three vector
+    // operands before replacing only acc; it performs no loads, stores, stack
+    // accesses, or flag updates. Each lane adds four signed i8 products modulo 2^32.
+    unsafe {
+        std::arch::asm!(
+            "sdot {acc:v}.4s, {lhs:v}.16b, {rhs:v}.16b",
+            acc = inout(vreg) acc,
+            lhs = in(vreg) lhs,
+            rhs = in(vreg) rhs,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    acc
+}
+
 /// Register-blocked SDOT GEMM micro-kernel: computes up to `MR=4` output rows
 /// (x-rows `sp..sp+rows`) against all `n` weight rows, tiling the inner loop into
 /// 4-w-row groups. Each k-step loads 4 weight chunks once (reused across the up-to
 /// 4 activation rows) and each activation chunk once (reused across the 4 weight
-/// rows), so a loaded vector feeds ~4 `vdotq_s32`s before eviction (compute:load
-/// ~= 2:1). Bit-identical to the scalar sum: vdotq accumulates the identical i32
+/// rows), so a loaded vector feeds ~4 SDOTs before eviction (compute:load
+/// ~= 2:1). Bit-identical to the scalar sum: SDOT accumulates the identical i32
 /// dot, and the `k % 16` tail is an exact scalar add. The `n % 4` tail uses the
 /// per-element dot.
 #[cfg(target_arch = "aarch64")]
@@ -48199,7 +48258,7 @@ unsafe fn gemm_block4_sdot(
     bias: Option<&[f32]>,
     out_blk: &mut [f32],
 ) {
-    use std::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::aarch64::{vaddvq_s32, vdupq_n_s32, vld1q_s8};
     let kfull = (k / 16) * 16;
     let np = (n / 4) * 4;
     let xp = x_i8.as_ptr();
@@ -48216,10 +48275,10 @@ unsafe fn gemm_block4_sdot(
             let w3 = vld1q_s8(wp.add((o + 3) * k + kk));
             for r in 0..rows {
                 let xv = vld1q_s8(xp.add((sp + r) * k + kk));
-                acc[r][0] = vdotq_s32(acc[r][0], xv, w0);
-                acc[r][1] = vdotq_s32(acc[r][1], xv, w1);
-                acc[r][2] = vdotq_s32(acc[r][2], xv, w2);
-                acc[r][3] = vdotq_s32(acc[r][3], xv, w3);
+                acc[r][0] = sdot_accumulate_i8x16(acc[r][0], xv, w0);
+                acc[r][1] = sdot_accumulate_i8x16(acc[r][1], xv, w1);
+                acc[r][2] = sdot_accumulate_i8x16(acc[r][2], xv, w2);
+                acc[r][3] = sdot_accumulate_i8x16(acc[r][3], xv, w3);
             }
             kk += 16;
         }
@@ -48369,7 +48428,7 @@ unsafe fn gemm_block4_sdot_packed(
     bias: Option<&[f32]>,
     out_blk: &mut [f32],
 ) {
-    use std::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::aarch64::{vaddvq_s32, vdupq_n_s32, vld1q_s8};
     let chunks = k / 16;
     let xp = x_i8.as_ptr();
     let wp = w_packed.as_ptr();
@@ -48387,10 +48446,10 @@ unsafe fn gemm_block4_sdot_packed(
             let kk = c * 16;
             for r in 0..rows {
                 let xv = vld1q_s8(xp.add((sp + r) * k + kk));
-                acc[r][0] = vdotq_s32(acc[r][0], xv, w0);
-                acc[r][1] = vdotq_s32(acc[r][1], xv, w1);
-                acc[r][2] = vdotq_s32(acc[r][2], xv, w2);
-                acc[r][3] = vdotq_s32(acc[r][3], xv, w3);
+                acc[r][0] = sdot_accumulate_i8x16(acc[r][0], xv, w0);
+                acc[r][1] = sdot_accumulate_i8x16(acc[r][1], xv, w1);
+                acc[r][2] = sdot_accumulate_i8x16(acc[r][2], xv, w2);
+                acc[r][3] = sdot_accumulate_i8x16(acc[r][3], xv, w3);
             }
         }
         for r in 0..rows {
@@ -48452,7 +48511,7 @@ fn dot_i8_scalar(a: &[i8], b: &[i8]) -> i32 {
 #[target_feature(enable = "dotprod")]
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 unsafe fn dot_i8_sdot(a: &[i8], b: &[i8]) -> i32 {
-    use std::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    use std::arch::aarch64::{vaddvq_s32, vdupq_n_s32, vld1q_s8};
     let k = a.len();
     let pa = a.as_ptr();
     let pb = b.as_ptr();
@@ -48462,7 +48521,7 @@ unsafe fn dot_i8_sdot(a: &[i8], b: &[i8]) -> i32 {
         // SAFETY: i + 16 <= k == a.len() == b.len(); 16 in-bounds bytes.
         let va = vld1q_s8(pa.add(i));
         let vb = vld1q_s8(pb.add(i));
-        acc = vdotq_s32(acc, va, vb);
+        acc = sdot_accumulate_i8x16(acc, va, vb);
         i += 16;
     }
     let mut sum = vaddvq_s32(acc);
@@ -54781,11 +54840,11 @@ mod tests {
         }
     }
 
-    // f64 sibling of min_max_f32: the SIMD f64x4 max/min must be BIT-IDENTICAL to the
-    // NaN-propagating scalar fmax/fmin across every ordered pair of IEEE f64 edge values.
+    // Exercise the public kernels against an independent comparison oracle,
+    // including their strided scalar fallback. Do not use Rust's min/max as the
+    // oracle: their choice of sign for equal zeros is toolchain-dependent.
     #[test]
     fn min_max_f64_simd_matches_scalar_bit_for_bit() {
-        use wide::f64x4;
         let edge = [
             0.0f64,
             -0.0,
@@ -54812,64 +54871,82 @@ mod tests {
                 r.push(b);
             }
         }
-        for k in 0..3 {
-            l.push(edge[k]);
-            r.push(edge[(k + 5) % edge.len()]);
+        // The Cartesian product fills SIMD vectors. Both zero orders must also
+        // appear in the scalar tail, whose contract is the same first-operand tie.
+        for (a, b) in [(0.0, -0.0), (-0.0, 0.0), (f64::NAN, 1.0)] {
+            l.push(a);
+            r.push(b);
         }
         let max_scalar = |x: f64, y: f64| {
             if x.is_nan() || y.is_nan() {
                 f64::NAN
+            } else if x < y {
+                y
             } else {
-                x.max(y)
+                x
             }
         };
         let min_scalar = |x: f64, y: f64| {
             if x.is_nan() || y.is_nan() {
                 f64::NAN
+            } else if y < x {
+                y
             } else {
-                x.min(y)
+                x
             }
         };
-        let max_simd = |a: f64x4, b: f64x4| {
-            let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
-        };
-        let min_simd = |a: f64x4, b: f64x4| {
-            let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
-        };
-        for (name, got, scalar) in [
+        let contiguous = TensorMeta::from_shape(vec![l.len()], DType::F64, Device::Cpu);
+        let strided =
+            TensorMeta::from_shape_and_strides(vec![l.len()], vec![2], 1, DType::F64, Device::Cpu)
+                .expect("valid strided view");
+        let l_strided: Vec<_> = l.iter().flat_map(|&v| [f64::NAN, v]).collect();
+        let r_strided: Vec<_> = r.iter().flat_map(|&v| [f64::NAN, v]).collect();
+        for (layout, lhs, rhs, meta) in [
+            ("contiguous", l.as_slice(), r.as_slice(), &contiguous),
             (
-                "max",
-                super::simd_binary_f64(&l, &r, max_scalar, max_simd),
-                max_scalar as fn(f64, f64) -> f64,
-            ),
-            (
-                "min",
-                super::simd_binary_f64(&l, &r, min_scalar, min_simd),
-                min_scalar as fn(f64, f64) -> f64,
+                "strided",
+                l_strided.as_slice(),
+                r_strided.as_slice(),
+                &strided,
             ),
         ] {
-            for (k, g) in got.iter().enumerate() {
-                let want = scalar(l[k], r[k]);
-                assert_eq!(
-                    g.to_bits(),
-                    want.to_bits(),
-                    "{name} f64 simd diverged from scalar at ({}, {}): got {g} want {want}",
-                    l[k],
-                    r[k]
-                );
+            for (name, got, scalar) in [
+                (
+                    "max",
+                    super::max_tensor_contiguous_f64(lhs, rhs, meta, meta)
+                        .expect("valid max inputs"),
+                    max_scalar as fn(f64, f64) -> f64,
+                ),
+                (
+                    "min",
+                    super::min_tensor_contiguous_f64(lhs, rhs, meta, meta)
+                        .expect("valid min inputs"),
+                    min_scalar as fn(f64, f64) -> f64,
+                ),
+            ] {
+                assert_eq!(got.len(), l.len());
+                for (k, g) in got.iter().enumerate() {
+                    let want = scalar(l[k], r[k]);
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "{name} f64 {layout} diverged at ({}, {}): got {g} want {want}",
+                        l[k],
+                        r[k]
+                    );
+                    if l[k] == 0.0 && r[k] == 0.0 {
+                        assert_eq!(g.to_bits(), l[k].to_bits(), "first zero must win");
+                    }
+                }
             }
         }
     }
 
-    // The SIMD f32 max/min ops must be BIT-IDENTICAL to the NaN-propagating scalar
-    // fmax/fmin (the prior kernel + the simd<->scalar boundary lane). Exhaustively cover
-    // EVERY ordered pair of IEEE edge values (±0, ±inf, NaN, ±subnormal, normals) so the
-    // sign-of-zero on ±0 ties and NaN propagation are checked in both operand positions.
+    // Every ordered pair of IEEE edge values goes through the public f32 kernels.
+    // A comparison oracle pins first-operand ties independently of scalar/SIMD
+    // min/max implementation details, including both signed-zero orders in tails.
     #[test]
     fn min_max_f32_simd_matches_scalar_bit_for_bit() {
-        use wide::f32x8;
         let edge = [
             0.0f32,
             -0.0,
@@ -54888,8 +54965,7 @@ mod tests {
             -1.0e30,
             3.0,
         ];
-        let n = edge.len();
-        // Cartesian product -> all ordered pairs, length n*n (a multiple of 8 here, so
+        // Cartesian product -> all ordered pairs, length 256 (a multiple of 8 here, so
         // every pair is evaluated through the f32x8 SIMD lanes), plus 5 extra pairs to
         // also exercise the scalar tail at the simd<->scalar boundary.
         let mut l: Vec<f32> = Vec::new();
@@ -54900,55 +54976,91 @@ mod tests {
                 r.push(b);
             }
         }
-        for k in 0..5 {
-            l.push(edge[k]);
-            r.push(edge[(k + 7) % n]);
+        for (a, b) in [
+            (0.0, -0.0),
+            (-0.0, 0.0),
+            (f32::NAN, 1.0),
+            (1.0, f32::NAN),
+            (-1.0, 2.0),
+        ] {
+            l.push(a);
+            r.push(b);
         }
         let max_scalar = |x: f32, y: f32| {
             if x.is_nan() || y.is_nan() {
                 f32::NAN
+            } else if x < y {
+                y
             } else {
-                x.max(y)
+                x
             }
         };
         let min_scalar = |x: f32, y: f32| {
             if x.is_nan() || y.is_nan() {
                 f32::NAN
+            } else if y < x {
+                y
             } else {
-                x.min(y)
+                x
             }
         };
-        let max_simd = |a: f32x8, b: f32x8| {
-            let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
-        };
-        let min_simd = |a: f32x8, b: f32x8| {
-            let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
-        };
-        for (name, got, scalar) in [
-            (
-                "max",
-                super::simd_binary_f32(&l, &r, max_scalar, max_simd),
-                max_scalar as fn(f32, f32) -> f32,
-            ),
-            (
-                "min",
-                super::simd_binary_f32(&l, &r, min_scalar, min_simd),
-                min_scalar as fn(f32, f32) -> f32,
-            ),
+        let contiguous = TensorMeta::from_shape(vec![l.len()], DType::F32, Device::Cpu);
+        let offset = contiguous.clone().with_storage_offset(1);
+        let l_offset: Vec<_> = std::iter::once(f32::NAN).chain(l.iter().copied()).collect();
+        let r_offset: Vec<_> = std::iter::once(f32::NAN).chain(r.iter().copied()).collect();
+        for (layout, lhs, rhs, meta) in [
+            ("contiguous", l.as_slice(), r.as_slice(), &contiguous),
+            ("offset", l_offset.as_slice(), r_offset.as_slice(), &offset),
         ] {
-            for (k, g) in got.iter().enumerate() {
-                let want = scalar(l[k], r[k]);
-                assert_eq!(
-                    g.to_bits(),
-                    want.to_bits(),
-                    "{name} simd diverged from scalar at pair ({}, {}): got {g} ({:08x}) want {want} ({:08x})",
-                    l[k],
-                    r[k],
-                    g.to_bits(),
-                    want.to_bits()
-                );
+            for (name, got, scalar) in [
+                (
+                    "max",
+                    super::max_tensor_contiguous_f32(lhs, rhs, meta, meta)
+                        .expect("valid max inputs"),
+                    max_scalar as fn(f32, f32) -> f32,
+                ),
+                (
+                    "min",
+                    super::min_tensor_contiguous_f32(lhs, rhs, meta, meta)
+                        .expect("valid min inputs"),
+                    min_scalar as fn(f32, f32) -> f32,
+                ),
+            ] {
+                assert_eq!(got.len(), l.len());
+                for (k, g) in got.iter().enumerate() {
+                    let want = scalar(l[k], r[k]);
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "{name} f32 {layout} diverged at ({}, {}): got {g} want {want}",
+                        l[k],
+                        r[k]
+                    );
+                    if l[k] == 0.0 && r[k] == 0.0 {
+                        assert_eq!(g.to_bits(), l[k].to_bits(), "first zero must win");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn min_max_scalar_preserve_first_zero_sign() {
+        for dtype in [DType::F32, DType::F64] {
+            for (left, right, expected_bits) in [
+                (0.0, 0.0, 0u64),
+                (0.0, -0.0, 0),
+                (-0.0, 0.0, 1 << 63),
+                (-0.0, -0.0, 1 << 63),
+            ] {
+                let lhs = ScalarTensor::new(left, dtype, Device::Cpu);
+                let rhs = ScalarTensor::new(right, dtype, Device::Cpu);
+                for got in [
+                    super::min_scalar(&lhs, &rhs).expect("compatible scalar min"),
+                    super::max_scalar(&lhs, &rhs).expect("compatible scalar max"),
+                ] {
+                    assert_eq!(got.value().to_bits(), expected_bits);
+                }
             }
         }
     }
@@ -55355,6 +55467,54 @@ mod tests {
     }
 
     // ── int8 dynamic-quantized linear (additive, inference-only) ──
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn sdot_accumulate_i8x16_matches_wrapping_scalar_lanes() {
+        use std::arch::aarch64::{vld1q_s8, vld1q_s32, vst1q_s32};
+
+        let has_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+        if std::env::var_os("FT_TEST_REQUIRE_DOTPROD").is_some() {
+            assert!(has_dotprod, "requested SDOT coverage is unavailable");
+        }
+        if !has_dotprod {
+            return;
+        }
+        for (lhs, rhs) in [
+            ([-128i8; 16], [-128i8; 16]),
+            (
+                [
+                    -128, -128, -128, -128, 127, 127, 127, 127, -128, 127, -1, 1, 2, -3, 4, -5,
+                ],
+                [
+                    -128, 127, -1, 1, 127, -128, 1, -1, 127, -128, -128, 127, -5, 4, -3, 2,
+                ],
+            ),
+        ] {
+            for initial in [[0i32; 4], [i32::MAX, i32::MIN, -7, 9]] {
+                let mut expected = initial;
+                for (lane, value) in expected.iter_mut().enumerate() {
+                    for offset in 0..4 {
+                        let index = lane * 4 + offset;
+                        *value = value.wrapping_add(i32::from(lhs[index]) * i32::from(rhs[index]));
+                    }
+                }
+                let mut actual = [0i32; 4];
+                // SAFETY: dotprod was detected above. All loads/stores span the
+                // complete 16-byte arrays, and the helper accesses only registers.
+                unsafe {
+                    let result = super::sdot_accumulate_i8x16(
+                        vld1q_s32(initial.as_ptr()),
+                        vld1q_s8(lhs.as_ptr()),
+                        vld1q_s8(rhs.as_ptr()),
+                    );
+                    vst1q_s32(actual.as_mut_ptr(), result);
+                }
+                assert_eq!(actual, expected, "initial accumulator {initial:?}");
+            }
+        }
+    }
+
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn linear_int8_dynamic_tracks_f32_reference() {
@@ -63718,6 +63878,96 @@ mod tests {
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    /// Exercise both SIMD backends with the same scalar scatter oracle. Widths
+    /// straddle four-lane boundaries, including scalar-only rows, multiple vectors,
+    /// and every tail length. Odd extents must retain their zero-filled edges.
+    #[test]
+    fn avg_pool2d_2x2s2_backward_simd_boundaries_match_scalar() {
+        let values = [
+            1.25,
+            -3.5,
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::from_bits(7),
+            -f64::from_bits(7),
+            f64::MAX,
+            -f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        let (batch, ch) = (2usize, 3usize);
+        for ih in [6usize, 7] {
+            for iw in 2usize..=19 {
+                let (oh, ow) = (ih / 2, iw / 2);
+                let dout: Vec<f64> = (0..batch * ch * oh * ow)
+                    .map(|i| values[i % values.len()])
+                    .collect();
+                let got = super::avg_pool2d_backward_f64(
+                    &dout, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+                );
+
+                // Independent zero-initialized scalar accumulation, including
+                // division instead of the SIMD backend's multiplication by 0.25.
+                let mut want = vec![0.0f64; batch * ch * ih * iw];
+                for plane in 0..batch * ch {
+                    for oy in 0..oh {
+                        for ox in 0..ow {
+                            let g = dout[plane * oh * ow + oy * ow + ox] / 4.0;
+                            for ky in 0..2 {
+                                for kx in 0..2 {
+                                    want[plane * ih * iw + (2 * oy + ky) * iw + 2 * ox + kx] += g;
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(got.len(), want.len());
+                for (index, (actual, expected)) in got.iter().zip(&want).enumerate() {
+                    if expected.is_nan() {
+                        // NaN payload propagation is not portable across SIMD targets.
+                        assert!(actual.is_nan(), "ih={ih} iw={iw} element {index}");
+                    } else {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "ih={ih} iw={iw} element {index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avg_pool2d_2x2s2_backward_empty_planes() {
+        for (batch, ch) in [(0usize, 3usize), (2, 0)] {
+            let got = super::avg_pool2d_backward_f64(
+                &[],
+                batch,
+                ch,
+                6,
+                10,
+                2,
+                2,
+                3,
+                5,
+                2,
+                2,
+                0,
+                0,
+                6,
+                10,
+                true,
+            );
+            assert!(got.is_empty());
+        }
     }
 
     /// `frankentorch-k1h8g`: the 2x2s2 backward writes into an UNINITIALIZED
